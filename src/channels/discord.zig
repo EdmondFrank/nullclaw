@@ -13,10 +13,11 @@ pub const DiscordChannel = struct {
     token: []const u8,
     guild_id: ?[]const u8,
     allow_bots: bool,
+    account_id: []const u8 = "default",
 
     // Optional gateway fields (have defaults so existing init works)
     allow_from: []const []const u8 = &.{},
-    mention_only: bool = false,
+    require_mention: bool = false,
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
     bus: ?*bus_mod.Bus = null,
 
@@ -29,7 +30,13 @@ pub const DiscordChannel = struct {
     resume_gateway_url: ?[]u8 = null,
     bot_user_id: ?[]u8 = null,
     gateway_thread: ?std.Thread = null,
-    ws_fd: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+    ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
+
+    const SocketFd = std.net.Stream.Handle;
+    const invalid_socket: SocketFd = switch (builtin.os.tag) {
+        .windows => std.os.windows.ws2_32.INVALID_SOCKET,
+        else => -1,
+    };
 
     pub const MAX_MESSAGE_LEN: usize = 2000;
     pub const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -45,6 +52,20 @@ pub const DiscordChannel = struct {
             .token = token,
             .guild_id = guild_id,
             .allow_bots = allow_bots,
+        };
+    }
+
+    /// Initialize from a full DiscordConfig, passing all fields.
+    pub fn initFromConfig(allocator: std.mem.Allocator, cfg: @import("../config_types.zig").DiscordConfig) DiscordChannel {
+        return .{
+            .allocator = allocator,
+            .token = cfg.token,
+            .guild_id = cfg.guild_id,
+            .allow_bots = cfg.allow_bots,
+            .account_id = cfg.account_id,
+            .allow_from = cfg.allow_from,
+            .require_mention = cfg.require_mention,
+            .intents = cfg.intents,
         };
     }
 
@@ -209,9 +230,11 @@ pub const DiscordChannel = struct {
         self.heartbeat_stop.store(true, .release);
         // Close socket to unblock blocking read
         const fd = self.ws_fd.load(.acquire);
-        if (fd >= 0) {
-            if (comptime builtin.os.tag != .windows) {
-                std.posix.close(@intCast(fd)) catch {};
+        if (fd != invalid_socket) {
+            if (comptime builtin.os.tag == .windows) {
+                _ = std.os.windows.ws2_32.closesocket(fd);
+            } else {
+                std.posix.close(fd);
             }
         }
         if (self.gateway_thread) |t| {
@@ -233,7 +256,7 @@ pub const DiscordChannel = struct {
         }
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
         try self.sendMessage(target, message);
     }
@@ -304,7 +327,7 @@ pub const DiscordChannel = struct {
         defer {
             self.heartbeat_stop.store(true, .release);
             hbt.join();
-            self.ws_fd.store(-1, .release);
+            self.ws_fd.store(invalid_socket, .release);
             ws.deinit();
         }
 
@@ -326,10 +349,8 @@ pub const DiscordChannel = struct {
             const text = maybe_text orelse break;
             defer self.allocator.free(text);
             self.handleGatewayMessage(&ws, text) catch |err| {
-                switch (err) {
-                    error.ShouldReconnect => break,
-                    else => log.err("Discord gateway msg error: {}", .{err}),
-                }
+                log.err("Discord gateway msg error: {}", .{err});
+                if (err == error.ShouldReconnect) break;
             };
         }
     }
@@ -626,8 +647,8 @@ pub const DiscordChannel = struct {
             return;
         }
 
-        // Filter 2: mention_only for guild (non-DM) messages
-        if (self.mention_only and guild_id != null) {
+        // Filter 2: require_mention for guild (non-DM) messages
+        if (self.require_mention and guild_id != null) {
             const bot_uid = self.bot_user_id orelse "";
             if (!isMentioned(content, bot_uid)) {
                 return;
@@ -641,19 +662,84 @@ pub const DiscordChannel = struct {
             }
         }
 
+        // Process attachments (if any)
+        var content_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer content_buf.deinit(self.allocator);
+
+        if (content.len > 0) {
+            content_buf.appendSlice(self.allocator, content) catch {};
+        }
+
+        if (d_obj.get("attachments")) |att_val| {
+            if (att_val == .array) {
+                var rand = std.crypto.random;
+                for (att_val.array.items) |att_item| {
+                    if (att_item == .object) {
+                        if (att_item.object.get("url")) |url_val| {
+                            if (url_val == .string) {
+                                const attach_url = url_val.string;
+
+                                // Download it
+                                if (root.http_util.curlGet(self.allocator, attach_url, &.{}, "30")) |img_data| {
+                                    defer self.allocator.free(img_data);
+
+                                    // Make temp file
+                                    const rand_id = rand.int(u64);
+                                    var path_buf: [1024]u8 = undefined;
+                                    const local_path = std.fmt.bufPrint(&path_buf, "/tmp/discord_{x}.dat", .{rand_id}) catch continue;
+
+                                    if (std.fs.createFileAbsolute(local_path, .{ .read = false })) |file| {
+                                        file.writeAll(img_data) catch {
+                                            file.close();
+                                            continue;
+                                        };
+                                        file.close();
+
+                                        if (content_buf.items.len > 0) content_buf.appendSlice(self.allocator, "\n") catch {};
+                                        content_buf.appendSlice(self.allocator, "[IMAGE:") catch {};
+                                        content_buf.appendSlice(self.allocator, local_path) catch {};
+                                        content_buf.appendSlice(self.allocator, "]") catch {};
+                                    } else |_| {}
+                                } else |err| {
+                                    log.warn("Discord: failed to download attachment: {}", .{err});
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        const final_content = content_buf.toOwnedSlice(self.allocator) catch blk: {
+            break :blk try self.allocator.dupe(u8, content);
+        };
+        defer self.allocator.free(final_content);
+
         // Build session_key and publish to bus
         const session_key = try std.fmt.allocPrint(self.allocator, "discord:{s}", .{channel_id});
         defer self.allocator.free(session_key);
+
+        var metadata_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer metadata_buf.deinit(self.allocator);
+        const mw = metadata_buf.writer(self.allocator);
+        try mw.print("{{\"is_dm\":{s}", .{if (guild_id == null) "true" else "false"});
+        try mw.writeAll(",\"account_id\":");
+        try root.appendJsonStringW(mw, self.account_id);
+        if (guild_id) |gid| {
+            try mw.writeAll(",\"guild_id\":");
+            try root.appendJsonStringW(mw, gid);
+        }
+        try mw.writeByte('}');
 
         const msg = try bus_mod.makeInboundFull(
             self.allocator,
             "discord",
             author_id,
             channel_id,
-            content,
+            final_content,
             session_key,
             &.{},
-            null,
+            metadata_buf.items,
         );
 
         if (self.bus) |b| {
@@ -819,6 +905,27 @@ test "discord isMentioned with user id" {
 test "discord intents default" {
     const ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
     try std.testing.expectEqual(@as(u32, 37377), ch.intents);
+}
+
+test "discord initFromConfig passes all fields" {
+    const config_types = @import("../config_types.zig");
+    const cfg = config_types.DiscordConfig{
+        .account_id = "discord-main",
+        .token = "my-token",
+        .guild_id = "guild-1",
+        .allow_bots = true,
+        .allow_from = &.{ "user1", "user2" },
+        .require_mention = true,
+        .intents = 512,
+    };
+    const ch = DiscordChannel.initFromConfig(std.testing.allocator, cfg);
+    try std.testing.expectEqualStrings("my-token", ch.token);
+    try std.testing.expectEqualStrings("guild-1", ch.guild_id.?);
+    try std.testing.expect(ch.allow_bots);
+    try std.testing.expectEqualStrings("discord-main", ch.account_id);
+    try std.testing.expectEqual(@as(usize, 2), ch.allow_from.len);
+    try std.testing.expect(ch.require_mention);
+    try std.testing.expectEqual(@as(u32, 512), ch.intents);
 }
 
 test "discord intent bitmask guilds" {

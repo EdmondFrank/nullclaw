@@ -11,6 +11,7 @@
 const std = @import("std");
 const platform = @import("platform.zig");
 const Config = @import("config.zig").Config;
+const channel_catalog = @import("channel_catalog.zig");
 const daemon = @import("daemon.zig");
 const cron = @import("cron.zig");
 const builtin = @import("builtin");
@@ -259,16 +260,22 @@ pub fn checkConfigSemantics(
 
     // Channels: at least one configured
     const ch = &config.channels;
-    const has_channel = ch.telegram != null or
-        ch.discord != null or
-        ch.slack != null or
+    const has_channel = ch.telegram.len > 0 or
+        ch.discord.len > 0 or
+        ch.slack.len > 0 or
         ch.webhook != null or
         ch.imessage != null or
         ch.matrix != null or
         ch.whatsapp != null or
         ch.irc != null or
         ch.lark != null or
-        ch.dingtalk != null;
+        ch.dingtalk != null or
+        ch.signal.len > 0 or
+        ch.email != null or
+        ch.line != null or
+        ch.qq.len > 0 or
+        ch.onebot.len > 0 or
+        ch.maixcam.len > 0;
 
     if (has_channel) {
         try items.append(allocator, DiagItem.ok(cat, "at least one channel configured"));
@@ -656,18 +663,11 @@ fn checkChannels(allocator: std.mem.Allocator, cfg: *const Config, items: *std.A
     const cat = "channels";
     items.append(allocator, DiagItem.ok(cat, "CLI always available")) catch {};
 
-    if (cfg.channels.telegram != null)
-        items.append(allocator, DiagItem.ok(cat, "Telegram configured")) catch {};
-    if (cfg.channels.discord != null)
-        items.append(allocator, DiagItem.ok(cat, "Discord configured")) catch {};
-    if (cfg.channels.slack != null)
-        items.append(allocator, DiagItem.ok(cat, "Slack configured")) catch {};
-    if (cfg.channels.webhook != null)
-        items.append(allocator, DiagItem.ok(cat, "Webhook configured")) catch {};
-    if (cfg.channels.matrix != null)
-        items.append(allocator, DiagItem.ok(cat, "Matrix configured")) catch {};
-    if (cfg.channels.irc != null)
-        items.append(allocator, DiagItem.ok(cat, "IRC configured")) catch {};
+    for (channel_catalog.known_channels) |meta| {
+        if (meta.id == .cli) continue;
+        if (!channel_catalog.isConfigured(cfg, meta.id)) continue;
+        items.append(allocator, DiagItem.ok(cat, meta.configured_message)) catch {};
+    }
 }
 
 /// Check a specific diagnostic (utility for programmatic access).

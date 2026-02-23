@@ -9,6 +9,8 @@ pub const WhatsAppChannel = struct {
     phone_number_id: []const u8,
     verify_token: []const u8,
     allow_from: []const []const u8,
+    group_allow_from: []const []const u8,
+    group_policy: []const u8,
 
     pub const API_VERSION = "v18.0";
 
@@ -18,6 +20,8 @@ pub const WhatsAppChannel = struct {
         phone_number_id: []const u8,
         verify_token: []const u8,
         allow_from: []const []const u8,
+        group_allow_from: []const []const u8,
+        group_policy: []const u8,
     ) WhatsAppChannel {
         return .{
             .allocator = allocator,
@@ -25,6 +29,8 @@ pub const WhatsAppChannel = struct {
             .phone_number_id = phone_number_id,
             .verify_token = verify_token,
             .allow_from = allow_from,
+            .group_allow_from = group_allow_from,
+            .group_policy = group_policy,
         };
     }
 
@@ -38,7 +44,7 @@ pub const WhatsAppChannel = struct {
 
     /// Check if a phone number is allowed (E.164 format: +1234567890).
     pub fn isNumberAllowed(self: *const WhatsAppChannel, phone: []const u8) bool {
-        return root.isAllowedExact(self.allow_from, phone);
+        return root.isAllowed(self.allow_from, phone);
     }
 
     /// Normalize a phone number to E.164 (prepend + if missing).
@@ -69,15 +75,29 @@ pub const WhatsAppChannel = struct {
         const val = parsed.value;
 
         // Navigate: entry[] -> changes[] -> value -> messages[]
-        const entries = (val.object.get("entry") orelse return result.items).array.items;
+        if (val != .object) return result.items;
+        const entry_val = val.object.get("entry") orelse return result.items;
+        if (entry_val != .array) return result.items;
+        const entries = entry_val.array.items;
         for (entries) |entry| {
-            const changes = ((entry.object.get("changes")) orelse continue).array.items;
+            if (entry != .object) continue;
+            const changes_val = entry.object.get("changes") orelse continue;
+            if (changes_val != .array) continue;
+            const changes = changes_val.array.items;
             for (changes) |change| {
-                const value_obj = (change.object.get("value") orelse continue).object;
-                const messages = ((value_obj.get("messages")) orelse continue).array.items;
+                if (change != .object) continue;
+                const value_val = change.object.get("value") orelse continue;
+                if (value_val != .object) continue;
+                const value_obj = value_val.object;
+                const messages_val = value_obj.get("messages") orelse continue;
+                if (messages_val != .array) continue;
+                const messages = messages_val.array.items;
 
                 for (messages) |msg| {
-                    const from_val = msg.object.get("from") orelse continue;
+                    if (msg != .object) continue;
+                    const msg_obj = msg.object;
+
+                    const from_val = msg_obj.get("from") orelse continue;
                     const from = if (from_val == .string) from_val.string else continue;
 
                     // Normalize phone
@@ -87,14 +107,28 @@ pub const WhatsAppChannel = struct {
                     // Check allowlist
                     if (!self.isNumberAllowed(normalized)) continue;
 
+                    // Check group policy
+                    const is_group_msg = if (msg_obj.get("context")) |ctx|
+                        if (ctx == .object) (ctx.object.get("group_jid") != null) else false
+                    else
+                        false;
+
+                    if (is_group_msg) {
+                        if (std.mem.eql(u8, self.group_policy, "disabled")) continue;
+                        if (!std.mem.eql(u8, self.group_policy, "open")) {
+                            if (self.group_allow_from.len > 0 and !root.isAllowed(self.group_allow_from, normalized)) continue;
+                        }
+                    }
+
                     // Extract text only
-                    const text_obj = msg.object.get("text") orelse continue;
+                    const text_obj = msg_obj.get("text") orelse continue;
+                    if (text_obj != .object) continue;
                     const body_val = text_obj.object.get("body") orelse continue;
                     const body = if (body_val == .string) body_val.string else continue;
                     if (body.len == 0) continue;
 
                     // Extract timestamp
-                    const ts_val = msg.object.get("timestamp");
+                    const ts_val = msg_obj.get("timestamp");
                     const timestamp = blk: {
                         if (ts_val) |tv| {
                             if (tv == .string) {
@@ -114,6 +148,88 @@ pub const WhatsAppChannel = struct {
         }
 
         return result.toOwnedSlice(allocator);
+    }
+
+    /// Fetches an image media from WhatsApp Cloud API using its ID, saves it to a temp file,
+    /// and returns the path formatted as `[IMAGE:/path]`.
+    pub fn downloadMediaFromPayload(allocator: std.mem.Allocator, access_token: []const u8, payload: []const u8) ?[]const u8 {
+        if (access_token.len == 0) return null;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return null;
+        defer parsed.deinit();
+
+        // Navigate to the image ID
+        const val = parsed.value;
+        if (val != .object) return null;
+        const entry_raw = val.object.get("entry") orelse return null;
+        if (entry_raw != .array) return null;
+        const entries = entry_raw.array.items;
+        if (entries.len == 0) return null;
+        if (entries[0] != .object) return null;
+        const changes_raw = entries[0].object.get("changes") orelse return null;
+        if (changes_raw != .array) return null;
+        const changes = changes_raw.array.items;
+        if (changes.len == 0) return null;
+        if (changes[0] != .object) return null;
+        const value_raw = changes[0].object.get("value") orelse return null;
+        if (value_raw != .object) return null;
+        const value_obj = value_raw.object;
+        const messages_val = value_obj.get("messages") orelse return null;
+        if (messages_val != .array) return null;
+        const messages = messages_val.array.items;
+        if (messages.len == 0) return null;
+        if (messages[0] != .object) return null;
+        const msg = messages[0].object;
+
+        const img_obj = msg.get("image") orelse return null;
+        if (img_obj != .object) return null;
+        const id_val = img_obj.object.get("id") orelse return null;
+        if (id_val != .string) return null;
+        const media_id = id_val.string;
+
+        // Step 1: Get media URL
+        var url_buf: [256]u8 = undefined;
+        const info_url = std.fmt.bufPrint(&url_buf, "https://graph.facebook.com/{s}/{s}", .{ API_VERSION, media_id }) catch return null;
+
+        var auth_buf: [512]u8 = undefined;
+        const auth_header = std.fmt.bufPrint(&auth_buf, "Authorization: Bearer {s}", .{access_token}) catch return null;
+
+        const info_resp = root.http_util.curlGet(allocator, info_url, &.{auth_header}, "10") catch return null;
+        defer allocator.free(info_resp);
+
+        var info_parsed = std.json.parseFromSlice(std.json.Value, allocator, info_resp, .{}) catch return null;
+        defer info_parsed.deinit();
+
+        if (info_parsed.value != .object) return null;
+        const url_val = info_parsed.value.object.get("url") orelse return null;
+        if (url_val != .string) return null;
+        const media_url = url_val.string;
+
+        // Step 2: Download media bytes
+        const media_resp = root.http_util.curlGet(allocator, media_url, &.{auth_header}, "30") catch return null;
+        defer allocator.free(media_resp);
+
+        // Step 3: Write to tmp file
+        var rand = std.crypto.random;
+        var path_buf: [1024]u8 = undefined;
+        const local_path = std.fmt.bufPrint(&path_buf, "/tmp/whatsapp_{x}.dat", .{rand.int(u64)}) catch return null;
+
+        if (std.fs.createFileAbsolute(local_path, .{ .read = false })) |file| {
+            file.writeAll(media_resp) catch {
+                file.close();
+                return null;
+            };
+            file.close();
+
+            // Format as [IMAGE:path]
+            var out_buf: std.ArrayListUnmanaged(u8) = .empty;
+            out_buf.appendSlice(allocator, "[IMAGE:") catch return null;
+            out_buf.appendSlice(allocator, local_path) catch return null;
+            out_buf.appendSlice(allocator, "]") catch return null;
+            return out_buf.toOwnedSlice(allocator) catch null;
+        } else |_| {
+            return null;
+        }
     }
 
     pub fn healthCheck(_: *WhatsAppChannel) bool {
@@ -178,7 +294,7 @@ pub const WhatsAppChannel = struct {
         _ = ptr;
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *WhatsAppChannel = @ptrCast(@alignCast(ptr));
         try self.sendMessage(target, message);
     }
@@ -222,7 +338,7 @@ pub const ParsedMessage = struct {
 // ════════════════════════════════════════════════════════════════════════════
 
 test "whatsapp verify token" {
-    const ch = WhatsAppChannel.init(std.testing.allocator, "tok", "123", "my-verify", &.{});
+    const ch = WhatsAppChannel.init(std.testing.allocator, "tok", "123", "my-verify", &.{}, &.{}, "allowlist");
     try std.testing.expectEqualStrings("my-verify", ch.getVerifyToken());
 }
 
@@ -235,7 +351,7 @@ test "whatsapp normalize phone" {
 test "whatsapp parse empty payload" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const msgs = try ch.parseWebhookPayload(allocator, "{}");
     defer allocator.free(msgs);
     try std.testing.expectEqual(@as(usize, 0), msgs.len);
@@ -244,7 +360,7 @@ test "whatsapp parse empty payload" {
 test "whatsapp parse valid text message" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"+1234567890"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
 
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","timestamp":"1699999999","type":"text","text":{"body":"Hello nullclaw!"}}]}}]}]}
@@ -268,7 +384,7 @@ test "whatsapp parse valid text message" {
 test "whatsapp parse unauthorized number filtered" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"+1234567890"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
 
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"9999999999","timestamp":"1","type":"text","text":{"body":"Spam"}}]}}]}]}
@@ -282,7 +398,7 @@ test "whatsapp parse unauthorized number filtered" {
 test "whatsapp parse non-text message skipped" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
 
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"image","image":{"id":"img123"}}]}}]}]}
@@ -300,7 +416,7 @@ test "whatsapp parse non-text message skipped" {
 test "whatsapp parse missing entry array" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const msgs = try ch.parseWebhookPayload(allocator, "{\"object\":\"whatsapp_business_account\"}");
     defer allocator.free(msgs);
     try std.testing.expectEqual(@as(usize, 0), msgs.len);
@@ -309,7 +425,7 @@ test "whatsapp parse missing entry array" {
 test "whatsapp parse missing changes array" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const msgs = try ch.parseWebhookPayload(allocator, "{\"entry\":[{\"id\":\"123\"}]}");
     defer allocator.free(msgs);
     try std.testing.expectEqual(@as(usize, 0), msgs.len);
@@ -318,7 +434,7 @@ test "whatsapp parse missing changes array" {
 test "whatsapp parse missing value" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const msgs = try ch.parseWebhookPayload(allocator, "{\"entry\":[{\"changes\":[{\"field\":\"messages\"}]}]}");
     defer allocator.free(msgs);
     try std.testing.expectEqual(@as(usize, 0), msgs.len);
@@ -327,16 +443,36 @@ test "whatsapp parse missing value" {
 test "whatsapp parse missing messages array" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const msgs = try ch.parseWebhookPayload(allocator, "{\"entry\":[{\"changes\":[{\"value\":{\"metadata\":{}}}]}]}");
     defer allocator.free(msgs);
     try std.testing.expectEqual(@as(usize, 0), msgs.len);
 }
 
+test "whatsapp parse malformed message types are ignored" {
+    const allocator = std.testing.allocator;
+    const nums = [_][]const u8{"*"};
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
+    const payload =
+        \\{"entry":[{"changes":[{"value":{"messages":["not-an-object",{"from":"111","timestamp":"1","type":"text","text":"not-an-object"}]}}]}]}
+    ;
+    const msgs = try ch.parseWebhookPayload(allocator, payload);
+    defer allocator.free(msgs);
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
+test "whatsapp download media malformed messages type returns null" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"entry":[{"changes":[{"value":{"messages":{"id":"oops"}}}]}]}
+    ;
+    try std.testing.expect(WhatsAppChannel.downloadMediaFromPayload(allocator, "tok", payload) == null);
+}
+
 test "whatsapp parse missing from field" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"timestamp":"1","type":"text","text":{"body":"No sender"}}]}}]}]}
     ;
@@ -348,7 +484,7 @@ test "whatsapp parse missing from field" {
 test "whatsapp parse missing text body" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"text","text":{}}]}}]}]}
     ;
@@ -360,7 +496,7 @@ test "whatsapp parse missing text body" {
 test "whatsapp parse null text body" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"text","text":{"body":null}}]}}]}]}
     ;
@@ -372,7 +508,7 @@ test "whatsapp parse null text body" {
 test "whatsapp parse invalid timestamp uses current" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"not_a_number","type":"text","text":{"body":"Hello"}}]}}]}]}
     ;
@@ -391,7 +527,7 @@ test "whatsapp parse invalid timestamp uses current" {
 test "whatsapp parse missing timestamp uses current" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","type":"text","text":{"body":"Hello"}}]}}]}]}
     ;
@@ -410,7 +546,7 @@ test "whatsapp parse missing timestamp uses current" {
 test "whatsapp parse multiple messages" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"text","text":{"body":"First"}},{"from":"222","timestamp":"2","type":"text","text":{"body":"Second"}}]}}]}]}
     ;
@@ -430,7 +566,7 @@ test "whatsapp parse multiple messages" {
 test "whatsapp parse multiple entries" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"text","text":{"body":"Entry 1"}}]}}]},{"changes":[{"value":{"messages":[{"from":"222","timestamp":"2","type":"text","text":{"body":"Entry 2"}}]}}]}]}
     ;
@@ -450,7 +586,7 @@ test "whatsapp parse multiple entries" {
 test "whatsapp parse multiple changes" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"text","text":{"body":"Change 1"}}]}},{"value":{"messages":[{"from":"222","timestamp":"2","type":"text","text":{"body":"Change 2"}}]}}]}]}
     ;
@@ -470,7 +606,7 @@ test "whatsapp parse multiple changes" {
 test "whatsapp parse status update ignored" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"statuses":[{"id":"wamid.xxx","status":"delivered","timestamp":"1699999999"}]}}]}]}
     ;
@@ -482,7 +618,7 @@ test "whatsapp parse status update ignored" {
 test "whatsapp parse audio message skipped" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"audio","audio":{"id":"audio123"}}]}}]}]}
     ;
@@ -494,7 +630,7 @@ test "whatsapp parse audio message skipped" {
 test "whatsapp parse video message skipped" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"video","video":{"id":"video123"}}]}}]}]}
     ;
@@ -506,7 +642,7 @@ test "whatsapp parse video message skipped" {
 test "whatsapp parse document message skipped" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"document","document":{"id":"doc123"}}]}}]}]}
     ;
@@ -518,7 +654,7 @@ test "whatsapp parse document message skipped" {
 test "whatsapp parse sticker message skipped" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"sticker","sticker":{"id":"sticker123"}}]}}]}]}
     ;
@@ -530,7 +666,7 @@ test "whatsapp parse sticker message skipped" {
 test "whatsapp parse location message skipped" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"location","location":{"latitude":40.7128}}]}}]}]}
     ;
@@ -542,7 +678,7 @@ test "whatsapp parse location message skipped" {
 test "whatsapp parse contacts message skipped" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"contacts","contacts":[]}]}}]}]}
     ;
@@ -554,7 +690,7 @@ test "whatsapp parse contacts message skipped" {
 test "whatsapp parse mixed authorized unauthorized" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"+1111111111"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"1111111111","timestamp":"1","type":"text","text":{"body":"Allowed"}},{"from":"9999999999","timestamp":"2","type":"text","text":{"body":"Blocked"}},{"from":"1111111111","timestamp":"3","type":"text","text":{"body":"Also allowed"}}]}}]}]}
     ;
@@ -574,7 +710,7 @@ test "whatsapp parse mixed authorized unauthorized" {
 test "whatsapp parse unicode message" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"text","text":{"body":"Hello world"}}]}}]}]}
     ;
@@ -593,7 +729,7 @@ test "whatsapp parse unicode message" {
 test "whatsapp parse whitespace only message passes through" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"text","text":{"body":"   "}}]}}]}]}
     ;
@@ -612,7 +748,7 @@ test "whatsapp parse whitespace only message passes through" {
 
 test "whatsapp number allowed multiple numbers" {
     const nums = [_][]const u8{ "+1111111111", "+2222222222", "+3333333333" };
-    const ch = WhatsAppChannel.init(std.testing.allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(std.testing.allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     try std.testing.expect(ch.isNumberAllowed("+1111111111"));
     try std.testing.expect(ch.isNumberAllowed("+2222222222"));
     try std.testing.expect(ch.isNumberAllowed("+3333333333"));
@@ -621,7 +757,7 @@ test "whatsapp number allowed multiple numbers" {
 
 test "whatsapp number allowed case sensitive" {
     const nums = [_][]const u8{"+1234567890"};
-    const ch = WhatsAppChannel.init(std.testing.allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(std.testing.allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     try std.testing.expect(ch.isNumberAllowed("+1234567890"));
     try std.testing.expect(!ch.isNumberAllowed("+1234567891"));
 }
@@ -629,7 +765,7 @@ test "whatsapp number allowed case sensitive" {
 test "whatsapp parse phone already has plus" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"+1234567890"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"+1234567890","timestamp":"1","type":"text","text":{"body":"Hi"}}]}}]}]}
     ;
@@ -648,7 +784,7 @@ test "whatsapp parse phone already has plus" {
 test "whatsapp parse normalizes phone with plus" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"+1234567890"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","timestamp":"1","type":"text","text":{"body":"Hi"}}]}}]}]}
     ;
@@ -666,7 +802,7 @@ test "whatsapp parse normalizes phone with plus" {
 
 test "whatsapp channel fields stored correctly" {
     const nums = [_][]const u8{ "+111", "+222" };
-    const ch = WhatsAppChannel.init(std.testing.allocator, "my-access-token", "phone-id-123", "my-verify-token", &nums);
+    const ch = WhatsAppChannel.init(std.testing.allocator, "my-access-token", "phone-id-123", "my-verify-token", &nums, &.{}, "allowlist");
     try std.testing.expectEqualStrings("my-verify-token", ch.getVerifyToken());
     try std.testing.expect(ch.isNumberAllowed("+111"));
     try std.testing.expect(ch.isNumberAllowed("+222"));
@@ -676,7 +812,7 @@ test "whatsapp channel fields stored correctly" {
 test "whatsapp parse empty messages array" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const msgs = try ch.parseWebhookPayload(allocator, "{\"entry\":[{\"changes\":[{\"value\":{\"messages\":[]}}]}]}");
     defer allocator.free(msgs);
     try std.testing.expectEqual(@as(usize, 0), msgs.len);
@@ -685,7 +821,7 @@ test "whatsapp parse empty messages array" {
 test "whatsapp parse empty entry array" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const msgs = try ch.parseWebhookPayload(allocator, "{\"entry\":[]}");
     defer allocator.free(msgs);
     try std.testing.expectEqual(@as(usize, 0), msgs.len);
@@ -694,7 +830,7 @@ test "whatsapp parse empty entry array" {
 test "whatsapp parse empty changes array" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const msgs = try ch.parseWebhookPayload(allocator, "{\"entry\":[{\"changes\":[]}]}");
     defer allocator.free(msgs);
     try std.testing.expectEqual(@as(usize, 0), msgs.len);
@@ -703,7 +839,7 @@ test "whatsapp parse empty changes array" {
 test "whatsapp parse newlines preserved" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"text","text":{"body":"Line 1\nLine 2\nLine 3"}}]}}]}]}
     ;
@@ -722,7 +858,7 @@ test "whatsapp parse newlines preserved" {
 test "whatsapp parse special characters" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"text","text":{"body":"quotes and 'apostrophe'"}}]}}]}]}
     ;
@@ -741,7 +877,7 @@ test "whatsapp parse special characters" {
 test "whatsapp empty text skipped" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"*"};
-    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums);
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"111","timestamp":"1","type":"text","text":{"body":""}}]}}]}]}
     ;
