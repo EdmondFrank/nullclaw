@@ -1,6 +1,8 @@
 const std = @import("std");
 const root = @import("root.zig");
 
+const log = std.log.scoped(.lark);
+
 /// Lark/Feishu channel — receives events via HTTP callback, sends via Open API.
 ///
 /// Supports two regional endpoints (configured via `use_feishu`):
@@ -247,9 +249,6 @@ pub const LarkChannel = struct {
     /// POST /im/v1/messages?receive_id_type=chat_id
     /// On 401, invalidates cached token and retries once.
     pub fn sendMessage(self: *LarkChannel, recipient: []const u8, text: []const u8) !void {
-        const token = try self.getTenantAccessToken();
-        defer self.allocator.free(token);
-
         const base = self.apiBase();
 
         // Build URL
@@ -279,68 +278,88 @@ pub const LarkChannel = struct {
         try w.writeAll("}");
         const body = fbs.getWritten();
 
-        // Build auth header
-        var auth_buf: [512]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Bearer {s}", .{token});
-        const auth_value = auth_fbs.getWritten();
+        // Retry up to 3 times
+        var attempt: u8 = 0;
+        while (attempt < 3) : (attempt += 1) {
+            log.info("Lark send attempt {d}/3", .{attempt + 1});
+            
+            // Get fresh token for each attempt (handles token expiration)
+            const token = self.getTenantAccessToken() catch |err| {
+                log.err("Failed to get tenant access token on attempt {d}: {}", .{attempt + 1, err});
+                if (attempt == 2) return error.LarkApiError; // Last attempt failed
+                std.Thread.sleep(1000 * 1000 * 1000); // 1 second delay
+                continue;
+            };
+            defer self.allocator.free(token);
 
-        var client = std.http.Client{ .allocator = self.allocator };
-        defer client.deinit();
+            // Build auth header
+            var auth_buf: [512]u8 = undefined;
+            var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+            try auth_fbs.writer().print("Bearer {s}", .{token});
+            const auth_value = auth_fbs.getWritten();
 
-        const send_result = client.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = body,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
-                .{ .name = "Authorization", .value = auth_value },
-            },
-        }) catch return error.LarkApiError;
+            var client = std.http.Client{ .allocator = self.allocator };
+            defer client.deinit();
 
-        if (send_result.status == .unauthorized) {
-            // Token expired — invalidate cache and retry once
-            self.invalidateToken();
-            const new_token = self.getTenantAccessToken() catch return error.LarkApiError;
-            defer self.allocator.free(new_token);
-
-            var retry_auth_buf: [512]u8 = undefined;
-            var retry_auth_fbs = std.io.fixedBufferStream(&retry_auth_buf);
-            try retry_auth_fbs.writer().print("Bearer {s}", .{new_token});
-            const retry_auth_value = retry_auth_fbs.getWritten();
-
-            var retry_client = std.http.Client{ .allocator = self.allocator };
-            defer retry_client.deinit();
-
-            const retry_result = retry_client.fetch(.{
+            const send_result = client.fetch(.{
                 .location = .{ .url = url },
                 .method = .POST,
                 .payload = body,
                 .extra_headers = &.{
                     .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
-                    .{ .name = "Authorization", .value = retry_auth_value },
+                    .{ .name = "Authorization", .value = auth_value },
                 },
-            }) catch return error.LarkApiError;
+            }) catch |err| {
+                log.err("Lark API POST failed on attempt {d}: {}", .{attempt + 1, err});
+                log.err("Request details - URL: {s}", .{url});
+                log.err("Request details - Body: {s}", .{body});
+                log.err("Request details - Auth: {s}", .{auth_value});
+                if (attempt == 2) return error.LarkApiError; // Last attempt failed
+                std.Thread.sleep(1000 * 1000 * 1000); // 1 second delay
+                continue;
+            };
 
-            if (retry_result.status != .ok) {
+            if (send_result.status == .ok) {
+                log.info("Lark message sent successfully on attempt {d}", .{attempt + 1});
+                return;
+            }
+
+            // Handle non-OK status
+            if (send_result.status == .unauthorized) {
+                log.warn("Lark token expired (401) on attempt {d}, invalidating token", .{attempt + 1});
+                self.invalidateToken();
+            } else {
+                log.err("Lark API POST returned status {d} on attempt {d}", .{@intFromEnum(send_result.status), attempt + 1});
+                log.err("Response details - Status: {}", .{send_result.status});
+                log.err("Response details - URL: {s}", .{url});
+                log.err("Response details - Body: {s}", .{body});
+                log.err("Response details - Auth: {s}", .{auth_value});
+            }
+
+            // If this is the last attempt, return error
+            if (attempt == 2) {
+                log.err("All 3 attempts failed, giving up", .{});
                 return error.LarkApiError;
             }
-            return;
+
+            // Wait before next retry (except for last attempt)
+            std.Thread.sleep(1000 * 1000 * 1000); // 1 second delay
         }
 
-        if (send_result.status != .ok) {
-            return error.LarkApiError;
-        }
+        // This should never be reached, but just in case
+        return error.LarkApiError;
     }
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         _ = ptr;
+        log.info("Lark channel started", .{});
         // Lark: receives events via HTTP callback; no persistent connection.
         // TODO: WebSocket long-connection mode
     }
 
     fn vtableStop(ptr: *anyopaque) void {
         _ = ptr;
+        log.info("Lark channel stopped", .{});
     }
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
