@@ -7,37 +7,30 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bus_mod = @import("bus.zig");
 const Config = @import("config.zig").Config;
+const config_types = @import("config_types.zig");
+const channel_catalog = @import("channel_catalog.zig");
+const channel_adapters = @import("channel_adapters.zig");
 const dispatch = @import("channels/dispatch.zig");
 const channel_loop = @import("channel_loop.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
-
-// Channel modules
-const telegram = @import("channels/telegram.zig");
-const signal_ch = @import("channels/signal.zig");
-const discord = @import("channels/discord.zig");
-const qq = @import("channels/qq.zig");
-const onebot = @import("channels/onebot.zig");
-const slack = @import("channels/slack.zig");
-const matrix = @import("channels/matrix.zig");
-const irc = @import("channels/irc.zig");
-const imessage = @import("channels/imessage.zig");
-const email = @import("channels/email.zig");
-const dingtalk = @import("channels/dingtalk.zig");
-const maixcam = @import("channels/maixcam.zig");
-const whatsapp = @import("channels/whatsapp.zig");
-const line = @import("channels/line.zig");
-const lark = @import("channels/lark.zig");
-
-// Channel type from channels/root.zig
-const Channel = @import("channels/root.zig").Channel;
+const channels_mod = @import("channels/root.zig");
+const mattermost = channels_mod.mattermost;
+const discord = channels_mod.discord;
+const imessage = channels_mod.imessage;
+const qq = channels_mod.qq;
+const onebot = channels_mod.onebot;
+const maixcam = channels_mod.maixcam;
+const slack = channels_mod.slack;
+const irc = channels_mod.irc;
+const Channel = channels_mod.Channel;
 
 const log = std.log.scoped(.channel_manager);
 
 pub const ListenerType = enum {
     /// Telegram, Signal — poll in a loop
     polling,
-    /// Discord, QQ, OneBot — internal WebSocket/gateway
+    /// Discord, Mattermost, Slack, IRC, QQ, OneBot — internal socket/WebSocket loop
     gateway_loop,
     /// WhatsApp, Line, Lark — HTTP gateway receives
     webhook_only,
@@ -57,10 +50,7 @@ pub const Entry = struct {
     polling_state: ?PollingState = null,
 };
 
-pub const PollingState = union(enum) {
-    telegram: *channel_loop.TelegramLoopState,
-    signal: *channel_loop.SignalLoopState,
-};
+pub const PollingState = channel_loop.PollingState;
 
 pub const ChannelManager = struct {
     allocator: Allocator,
@@ -100,6 +90,7 @@ pub const ChannelManager = struct {
         return switch (state) {
             .telegram => |ls| ls.last_activity.load(.acquire),
             .signal => |ls| ls.last_activity.load(.acquire),
+            .matrix => |ls| ls.last_activity.load(.acquire),
         };
     }
 
@@ -107,6 +98,7 @@ pub const ChannelManager = struct {
         switch (state) {
             .telegram => |ls| ls.stop_requested.store(true, .release),
             .signal => |ls| ls.stop_requested.store(true, .release),
+            .matrix => |ls| ls.stop_requested.store(true, .release),
         }
     }
 
@@ -114,47 +106,45 @@ pub const ChannelManager = struct {
         switch (state) {
             .telegram => |ls| self.allocator.destroy(ls),
             .signal => |ls| self.allocator.destroy(ls),
+            .matrix => |ls| self.allocator.destroy(ls),
         }
     }
 
     fn spawnPollingThread(self: *ChannelManager, entry: *Entry, rt: *channel_loop.ChannelRuntime) !void {
-        if (std.mem.eql(u8, entry.name, "telegram")) {
-            const tg_ls = try self.allocator.create(channel_loop.TelegramLoopState);
-            errdefer self.allocator.destroy(tg_ls);
-            tg_ls.* = channel_loop.TelegramLoopState.init();
+        const polling_desc = channel_adapters.findPollingDescriptor(entry.name) orelse
+            return error.UnsupportedChannel;
+        const spawned = try polling_desc.spawn(self.allocator, self.config, rt, entry.channel);
+        entry.polling_state = spawned.state;
+        entry.thread = spawned.thread;
+    }
 
-            // Cast the opaque vtable pointer back to the concrete TelegramChannel
-            // so the polling loop operates on the same instance as the supervisor.
-            const tg_ptr: *telegram.TelegramChannel = @ptrCast(@alignCast(entry.channel.ptr));
+    fn isPollingSourceDuplicate(
+        allocator: Allocator,
+        entries: []const Entry,
+        current_index: usize,
+        polling_desc: *const channel_adapters.PollingDescriptor,
+    ) bool {
+        const source_key_fn = polling_desc.source_key orelse return false;
+        const current = entries[current_index];
+        if (!std.mem.eql(u8, current.name, polling_desc.channel_name)) return false;
+        if (current.listener_type != .polling) return false;
 
-            const thread = try std.Thread.spawn(
-                .{ .stack_size = 512 * 1024 },
-                channel_loop.runTelegramLoop,
-                .{ self.allocator, self.config, rt, tg_ls, tg_ptr },
-            );
-            tg_ls.thread = thread;
-            entry.polling_state = .{ .telegram = tg_ls };
-            entry.thread = thread;
-            return;
+        const current_source = source_key_fn(allocator, current.channel) orelse return false;
+        defer allocator.free(current_source);
+
+        var i: usize = 0;
+        while (i < current_index) : (i += 1) {
+            const prev = entries[i];
+            if (!std.mem.eql(u8, prev.name, polling_desc.channel_name)) continue;
+            if (prev.listener_type != .polling) continue;
+            if (prev.supervised.state != .running) continue;
+
+            const prev_source = source_key_fn(allocator, prev.channel) orelse continue;
+            const duplicate = std.mem.eql(u8, prev_source, current_source);
+            allocator.free(prev_source);
+            if (duplicate) return true;
         }
-
-        if (std.mem.eql(u8, entry.name, "signal")) {
-            const sg_ls = try self.allocator.create(channel_loop.SignalLoopState);
-            errdefer self.allocator.destroy(sg_ls);
-            sg_ls.* = channel_loop.SignalLoopState.init();
-
-            const thread = try std.Thread.spawn(
-                .{ .stack_size = 512 * 1024 },
-                channel_loop.runSignalLoop,
-                .{ self.allocator, self.config, rt, sg_ls },
-            );
-            sg_ls.thread = thread;
-            entry.polling_state = .{ .signal = sg_ls };
-            entry.thread = thread;
-            return;
-        }
-
-        return error.UnsupportedChannel;
+        return false;
     }
 
     fn stopPollingThread(self: *ChannelManager, entry: *Entry) void {
@@ -173,296 +163,119 @@ pub const ChannelManager = struct {
         }
     }
 
+    fn listenerTypeFromMode(mode: channel_catalog.ListenerMode) ListenerType {
+        return switch (mode) {
+            .polling => .polling,
+            .gateway_loop => .gateway_loop,
+            .webhook_only => .webhook_only,
+            .send_only => .send_only,
+            .none => .not_implemented,
+        };
+    }
+
+    fn listenerTypeForField(comptime field_name: []const u8) ListenerType {
+        const meta = channel_catalog.findByKey(field_name) orelse
+            @compileError("missing channel_catalog metadata for channel field: " ++ field_name);
+        return listenerTypeFromMode(meta.listener_mode);
+    }
+
+    fn accountIdFromConfig(cfg: anytype) []const u8 {
+        if (comptime @hasField(@TypeOf(cfg), "account_id")) {
+            return cfg.account_id;
+        }
+        return "default";
+    }
+
+    fn maybeAttachBus(self: *ChannelManager, channel_ptr: anytype) void {
+        const ChannelType = @TypeOf(channel_ptr.*);
+        if (self.event_bus) |eb| {
+            if (comptime @hasDecl(ChannelType, "setBus")) {
+                channel_ptr.setBus(eb);
+            }
+        }
+    }
+
+    fn appendChannelFromConfig(self: *ChannelManager, comptime field_name: []const u8, cfg: anytype) !void {
+        const channel_module = @field(channels_mod, field_name);
+        const ChannelType = channelTypeForModule(channel_module, field_name);
+
+        const ch_ptr = try self.allocator.create(ChannelType);
+        ch_ptr.* = ChannelType.initFromConfig(self.allocator, cfg);
+        self.maybeAttachBus(ch_ptr);
+
+        const ch = ch_ptr.channel();
+        const account_id = accountIdFromConfig(cfg);
+        try self.registry.registerWithAccount(ch, account_id);
+
+        const listener_type = comptime listenerTypeForField(field_name);
+        try self.entries.append(self.allocator, .{
+            .name = field_name,
+            .account_id = account_id,
+            .channel = ch,
+            .listener_type = listener_type,
+            .supervised = dispatch.spawnSupervisedChannel(ch, 5),
+        });
+    }
+
+    fn channelTypeForModule(comptime module: type, comptime field_name: []const u8) type {
+        inline for (std.meta.declarations(module)) |decl| {
+            const candidate = @field(module, decl.name);
+            if (comptime @TypeOf(candidate) == type) {
+                const T = candidate;
+                if (comptime @hasDecl(T, "initFromConfig") and @hasDecl(T, "channel")) {
+                    return T;
+                }
+            }
+        }
+        @compileError("channel module has no type with initFromConfig+channel methods: " ++ field_name);
+    }
+
     /// Scan config, create channel instances, register in registry.
     pub fn collectConfiguredChannels(self: *ChannelManager) !void {
-        // Telegram (all accounts)
-        for (self.config.channels.telegram) |tg_cfg| {
-            const tg_ptr = try self.allocator.create(telegram.TelegramChannel);
-            tg_ptr.* = telegram.TelegramChannel.init(
-                self.allocator,
-                tg_cfg.bot_token,
-                tg_cfg.allow_from,
-                tg_cfg.group_allow_from,
-                tg_cfg.group_policy,
-            );
-            tg_ptr.proxy = tg_cfg.proxy;
-            try self.registry.register(tg_ptr.channel());
-            try self.entries.append(self.allocator, .{
-                .name = "telegram",
-                .account_id = tg_cfg.account_id,
-                .channel = tg_ptr.channel(),
-                .listener_type = .polling,
-                .supervised = dispatch.spawnSupervisedChannel(tg_ptr.channel(), 5),
-            });
-        }
+        inline for (std.meta.fields(config_types.ChannelsConfig)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "cli") or std.mem.eql(u8, field.name, "webhook")) {
+                continue;
+            }
+            if (comptime !@hasDecl(channels_mod, field.name)) {
+                @compileError("channels/root.zig is missing module export for channel: " ++ field.name);
+            }
 
-        // Signal (all accounts)
-        for (self.config.channels.signal) |sg_cfg| {
-            const sg_ptr = try self.allocator.create(signal_ch.SignalChannel);
-            sg_ptr.* = signal_ch.SignalChannel.init(
-                self.allocator,
-                sg_cfg.http_url,
-                sg_cfg.account,
-                sg_cfg.allow_from,
-                sg_cfg.group_allow_from,
-                sg_cfg.ignore_attachments,
-                sg_cfg.ignore_stories,
-            );
-            sg_ptr.group_policy = sg_cfg.group_policy;
-            try self.registry.register(sg_ptr.channel());
-            try self.entries.append(self.allocator, .{
-                .name = "signal",
-                .account_id = sg_cfg.account_id,
-                .channel = sg_ptr.channel(),
-                .listener_type = .polling,
-                .supervised = dispatch.spawnSupervisedChannel(sg_ptr.channel(), 5),
-            });
-        }
-
-        // Discord (all accounts)
-        for (self.config.channels.discord) |dc_cfg| {
-            const dc_ptr = try self.allocator.create(discord.DiscordChannel);
-            dc_ptr.* = discord.DiscordChannel.initFromConfig(self.allocator, dc_cfg);
-            dc_ptr.bus = self.event_bus;
-            try self.registry.register(dc_ptr.channel());
-            try self.entries.append(self.allocator, .{
-                .name = "discord",
-                .account_id = dc_cfg.account_id,
-                .channel = dc_ptr.channel(),
-                .listener_type = .gateway_loop,
-                .supervised = dispatch.spawnSupervisedChannel(dc_ptr.channel(), 5),
-            });
-            log.info("Discord channel configured (gateway_loop)", .{});
-        }
-
-        // QQ (all accounts)
-        for (self.config.channels.qq) |qq_cfg| {
-            const qq_ptr = try self.allocator.create(qq.QQChannel);
-            qq_ptr.* = qq.QQChannel.init(self.allocator, qq_cfg);
-            if (self.event_bus) |eb| qq_ptr.setBus(eb);
-            try self.registry.register(qq_ptr.channel());
-            try self.entries.append(self.allocator, .{
-                .name = "qq",
-                .account_id = qq_cfg.account_id,
-                .channel = qq_ptr.channel(),
-                .listener_type = .gateway_loop,
-                .supervised = dispatch.spawnSupervisedChannel(qq_ptr.channel(), 5),
-            });
-        }
-
-        // OneBot (all accounts)
-        for (self.config.channels.onebot) |ob_cfg| {
-            const ob_ptr = try self.allocator.create(onebot.OneBotChannel);
-            ob_ptr.* = onebot.OneBotChannel.init(self.allocator, ob_cfg);
-            if (self.event_bus) |eb| ob_ptr.setBus(eb);
-            try self.registry.register(ob_ptr.channel());
-            try self.entries.append(self.allocator, .{
-                .name = "onebot",
-                .account_id = ob_cfg.account_id,
-                .channel = ob_ptr.channel(),
-                .listener_type = .gateway_loop,
-                .supervised = dispatch.spawnSupervisedChannel(ob_ptr.channel(), 5),
-            });
-        }
-
-        // WhatsApp — webhook only (inbound via gateway)
-        if (self.config.channels.whatsapp) |wa_cfg| {
-            const wa_ptr = try self.allocator.create(whatsapp.WhatsAppChannel);
-            wa_ptr.* = whatsapp.WhatsAppChannel.init(
-                self.allocator,
-                wa_cfg.access_token,
-                wa_cfg.phone_number_id,
-                wa_cfg.verify_token,
-                wa_cfg.allow_from,
-                wa_cfg.group_allow_from,
-                wa_cfg.group_policy,
-            );
-            try self.registry.register(wa_ptr.channel());
-            try self.entries.append(self.allocator, .{
-                .name = "whatsapp",
-                .channel = wa_ptr.channel(),
-                .listener_type = .webhook_only,
-                .supervised = dispatch.spawnSupervisedChannel(wa_ptr.channel(), 5),
-            });
-        }
-
-        // Line — webhook only
-        if (self.config.channels.line) |ln_cfg| {
-            const ln_ptr = try self.allocator.create(line.LineChannel);
-            ln_ptr.* = line.LineChannel.init(self.allocator, ln_cfg);
-            try self.registry.register(ln_ptr.channel());
-            try self.entries.append(self.allocator, .{
-                .name = "line",
-                .channel = ln_ptr.channel(),
-                .listener_type = .webhook_only,
-                .supervised = dispatch.spawnSupervisedChannel(ln_ptr.channel(), 5),
-            });
-        }
-
-        // Lark — webhook only
-        if (self.config.channels.lark) |lk_cfg| {
-            const lk_ptr = try self.allocator.create(lark.LarkChannel);
-            lk_ptr.* = lark.LarkChannel.init(
-                self.allocator,
-                lk_cfg.app_id,
-                lk_cfg.app_secret,
-                lk_cfg.verification_token orelse "",
-                lk_cfg.port orelse 9000,
-                lk_cfg.allow_from,
-            );
-            try self.registry.register(lk_ptr.channel());
-            try self.entries.append(self.allocator, .{
-                .name = "lark",
-                .channel = lk_ptr.channel(),
-                .listener_type = .webhook_only,
-                .supervised = dispatch.spawnSupervisedChannel(lk_ptr.channel(), 5),
-            });
-        }
-
-        // Slack (all accounts) — send-only (outbound ready; inbound listener not wired yet)
-        for (self.config.channels.slack) |sl_cfg| {
-            const sl_ptr = try self.allocator.create(slack.SlackChannel);
-            sl_ptr.* = slack.SlackChannel.init(
-                self.allocator,
-                sl_cfg.bot_token,
-                sl_cfg.app_token,
-                sl_cfg.channel_id,
-                sl_cfg.allow_from,
-            );
-            try self.registry.register(sl_ptr.channel());
-            try self.entries.append(self.allocator, .{
-                .name = "slack",
-                .account_id = sl_cfg.account_id,
-                .channel = sl_ptr.channel(),
-                .listener_type = .send_only,
-                .supervised = dispatch.spawnSupervisedChannel(sl_ptr.channel(), 5),
-            });
-        }
-
-        // Matrix — send-only (outbound ready; inbound listener not wired yet)
-        if (self.config.channels.matrix != null) {
-            const mx_cfg = self.config.channels.matrix.?;
-            const mx_ptr = try self.allocator.create(matrix.MatrixChannel);
-            mx_ptr.* = matrix.MatrixChannel.init(
-                self.allocator,
-                mx_cfg.homeserver,
-                mx_cfg.access_token,
-                mx_cfg.room_id,
-                mx_cfg.allow_from,
-            );
-            try self.registry.register(mx_ptr.channel());
-            try self.entries.append(self.allocator, .{
-                .name = "matrix",
-                .channel = mx_ptr.channel(),
-                .listener_type = .send_only,
-                .supervised = dispatch.spawnSupervisedChannel(mx_ptr.channel(), 5),
-            });
-        }
-
-        // IRC — send-only lifecycle (connect/start for outbound sends)
-        if (self.config.channels.irc != null) {
-            const irc_cfg = self.config.channels.irc.?;
-            const irc_ptr = try self.allocator.create(irc.IrcChannel);
-            irc_ptr.* = irc.IrcChannel.init(
-                self.allocator,
-                irc_cfg.host,
-                irc_cfg.port,
-                irc_cfg.nick,
-                irc_cfg.username,
-                irc_cfg.channels,
-                irc_cfg.allow_from,
-                irc_cfg.server_password,
-                irc_cfg.nickserv_password,
-                irc_cfg.sasl_password,
-                irc_cfg.tls,
-            );
-            try self.registry.register(irc_ptr.channel());
-            try self.entries.append(self.allocator, .{
-                .name = "irc",
-                .channel = irc_ptr.channel(),
-                .listener_type = .send_only,
-                .supervised = dispatch.spawnSupervisedChannel(irc_ptr.channel(), 5),
-            });
-        }
-
-        // iMessage — send-only
-        if (self.config.channels.imessage != null) {
-            const im_cfg = self.config.channels.imessage.?;
-            const im_ptr = try self.allocator.create(imessage.IMessageChannel);
-            im_ptr.* = imessage.IMessageChannel.init(
-                self.allocator,
-                im_cfg.allow_from,
-                im_cfg.group_allow_from,
-                im_cfg.group_policy,
-            );
-            try self.registry.register(im_ptr.channel());
-            try self.entries.append(self.allocator, .{
-                .name = "imessage",
-                .channel = im_ptr.channel(),
-                .listener_type = .send_only,
-                .supervised = dispatch.spawnSupervisedChannel(im_ptr.channel(), 5),
-            });
-        }
-
-        // Email — send-only
-        if (self.config.channels.email != null) {
-            const em_cfg = self.config.channels.email.?;
-            const em_ptr = try self.allocator.create(email.EmailChannel);
-            em_ptr.* = email.EmailChannel.init(self.allocator, em_cfg);
-            try self.registry.register(em_ptr.channel());
-            try self.entries.append(self.allocator, .{
-                .name = "email",
-                .channel = em_ptr.channel(),
-                .listener_type = .send_only,
-                .supervised = dispatch.spawnSupervisedChannel(em_ptr.channel(), 5),
-            });
-        }
-
-        // DingTalk — send-only
-        if (self.config.channels.dingtalk != null) {
-            const dt_cfg = self.config.channels.dingtalk.?;
-            const dt_ptr = try self.allocator.create(dingtalk.DingTalkChannel);
-            dt_ptr.* = dingtalk.DingTalkChannel.init(
-                self.allocator,
-                dt_cfg.client_id,
-                dt_cfg.client_secret,
-                dt_cfg.allow_from,
-            );
-            try self.registry.register(dt_ptr.channel());
-            try self.entries.append(self.allocator, .{
-                .name = "dingtalk",
-                .channel = dt_ptr.channel(),
-                .listener_type = .send_only,
-                .supervised = dispatch.spawnSupervisedChannel(dt_ptr.channel(), 5),
-            });
-        }
-
-        // MaixCam (all accounts) — send-only lifecycle
-        for (self.config.channels.maixcam) |mx_cfg| {
-            const mx_ptr = try self.allocator.create(maixcam.MaixCamChannel);
-            mx_ptr.* = maixcam.MaixCamChannel.init(self.allocator, mx_cfg);
-            mx_ptr.event_bus = self.event_bus;
-            try self.registry.register(mx_ptr.channel());
-            try self.entries.append(self.allocator, .{
-                .name = "maixcam",
-                .account_id = mx_cfg.account_id,
-                .channel = mx_ptr.channel(),
-                .listener_type = .send_only,
-                .supervised = dispatch.spawnSupervisedChannel(mx_ptr.channel(), 5),
-            });
+            switch (@typeInfo(field.type)) {
+                .pointer => |ptr| {
+                    if (ptr.size != .slice) continue;
+                    const items = @field(self.config.channels, field.name);
+                    for (items) |cfg| {
+                        try self.appendChannelFromConfig(field.name, cfg);
+                    }
+                },
+                .optional => {
+                    if (@field(self.config.channels, field.name)) |cfg| {
+                        try self.appendChannelFromConfig(field.name, cfg);
+                    }
+                },
+                else => {},
+            }
         }
     }
 
     /// Spawn listener threads for polling/gateway channels.
     pub fn startAll(self: *ChannelManager) !usize {
         var started: usize = 0;
+        const runtime_available = self.runtime != null;
 
-        for (self.entries.items) |*entry| {
+        for (self.entries.items, 0..) |*entry, index| {
             switch (entry.listener_type) {
                 .polling => {
-                    if (self.runtime == null) {
+                    if (!runtime_available) {
                         log.warn("Cannot start {s}: no runtime available", .{entry.name});
                         continue;
+                    }
+
+                    if (channel_adapters.findPollingDescriptor(entry.name)) |polling_desc| {
+                        if (isPollingSourceDuplicate(self.allocator, self.entries.items, index, polling_desc)) {
+                            log.warn("Skipping duplicate {s} polling source for account_id={s}", .{ entry.name, entry.account_id });
+                            continue;
+                        }
                     }
 
                     self.spawnPollingThread(entry, self.runtime.?) catch |err| {
@@ -475,7 +288,12 @@ pub const ChannelManager = struct {
                     log.info("{s} polling thread started", .{entry.name});
                 },
                 .gateway_loop => {
-                    // Gateway-loop channels (Discord, QQ, OneBot) manage their own connections
+                    if (!runtime_available) {
+                        log.warn("Cannot start {s} gateway: no runtime available", .{entry.name});
+                        continue;
+                    }
+                    // Gateway-loop channels (Discord, Mattermost, Slack, IRC, QQ, OneBot)
+                    // manage their own connection/read loops.
                     entry.channel.start() catch |err| {
                         log.warn("Failed to start {s} gateway: {}", .{ entry.name, err });
                         continue;
@@ -484,6 +302,10 @@ pub const ChannelManager = struct {
                     log.info("{s} gateway started", .{entry.name});
                 },
                 .webhook_only => {
+                    if (!runtime_available) {
+                        log.warn("Cannot register {s} webhook: no runtime available", .{entry.name});
+                        continue;
+                    }
                     // Webhook channels don't need a thread — they receive via the HTTP gateway
                     entry.channel.start() catch |err| {
                         log.warn("Failed to start {s}: {}", .{ entry.name, err });
@@ -634,15 +456,209 @@ pub const ChannelManager = struct {
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
 
-test "PollingState has telegram and signal variants" {
+test "PollingState has telegram signal and matrix variants" {
     try std.testing.expect(@intFromEnum(@as(std.meta.Tag(PollingState), .telegram)) !=
         @intFromEnum(@as(std.meta.Tag(PollingState), .signal)));
+    try std.testing.expect(@intFromEnum(@as(std.meta.Tag(PollingState), .signal)) !=
+        @intFromEnum(@as(std.meta.Tag(PollingState), .matrix)));
 }
 
 test "ListenerType enum values distinct" {
     try std.testing.expect(@intFromEnum(ListenerType.polling) != @intFromEnum(ListenerType.gateway_loop));
     try std.testing.expect(@intFromEnum(ListenerType.gateway_loop) != @intFromEnum(ListenerType.webhook_only));
     try std.testing.expect(@intFromEnum(ListenerType.webhook_only) != @intFromEnum(ListenerType.not_implemented));
+}
+
+test "isPollingSourceDuplicate detects duplicate signal source" {
+    const allocator = std.testing.allocator;
+
+    var sig_a = @import("channels/signal.zig").SignalChannel.init(
+        allocator,
+        "http://127.0.0.1:8080",
+        "+15550001111",
+        &.{},
+        &.{},
+        false,
+        false,
+    );
+    sig_a.account_id = "main";
+    var sig_b = @import("channels/signal.zig").SignalChannel.init(
+        allocator,
+        "http://127.0.0.1:8080",
+        "+15550001111",
+        &.{},
+        &.{},
+        false,
+        false,
+    );
+    sig_b.account_id = "backup";
+
+    var sup_a = dispatch.spawnSupervisedChannel(sig_a.channel(), 5);
+    sup_a.recordSuccess();
+    const sup_b = dispatch.spawnSupervisedChannel(sig_b.channel(), 5);
+
+    var entries = [_]Entry{
+        .{
+            .name = "signal",
+            .account_id = "main",
+            .channel = sig_a.channel(),
+            .listener_type = .polling,
+            .supervised = sup_a,
+            .thread = null,
+        },
+        .{
+            .name = "signal",
+            .account_id = "backup",
+            .channel = sig_b.channel(),
+            .listener_type = .polling,
+            .supervised = sup_b,
+            .thread = null,
+        },
+    };
+
+    const desc = channel_adapters.findPollingDescriptor("signal").?;
+    try std.testing.expect(ChannelManager.isPollingSourceDuplicate(allocator, &entries, 1, desc));
+}
+
+test "isPollingSourceDuplicate ignores distinct signal source" {
+    const allocator = std.testing.allocator;
+
+    var sig_a = @import("channels/signal.zig").SignalChannel.init(
+        allocator,
+        "http://127.0.0.1:8080",
+        "+15550001111",
+        &.{},
+        &.{},
+        false,
+        false,
+    );
+    var sig_b = @import("channels/signal.zig").SignalChannel.init(
+        allocator,
+        "http://127.0.0.1:8080",
+        "+15550002222",
+        &.{},
+        &.{},
+        false,
+        false,
+    );
+
+    var sup_a = dispatch.spawnSupervisedChannel(sig_a.channel(), 5);
+    sup_a.recordSuccess();
+    const sup_b = dispatch.spawnSupervisedChannel(sig_b.channel(), 5);
+
+    var entries = [_]Entry{
+        .{
+            .name = "signal",
+            .account_id = "main",
+            .channel = sig_a.channel(),
+            .listener_type = .polling,
+            .supervised = sup_a,
+            .thread = null,
+        },
+        .{
+            .name = "signal",
+            .account_id = "backup",
+            .channel = sig_b.channel(),
+            .listener_type = .polling,
+            .supervised = sup_b,
+            .thread = null,
+        },
+    };
+
+    const desc = channel_adapters.findPollingDescriptor("signal").?;
+    try std.testing.expect(!ChannelManager.isPollingSourceDuplicate(allocator, &entries, 1, desc));
+}
+
+test "isPollingSourceDuplicate detects duplicate telegram source" {
+    const allocator = std.testing.allocator;
+
+    var tg_a = @import("channels/telegram.zig").TelegramChannel.init(
+        allocator,
+        "same-token",
+        &.{},
+        &.{},
+        "allowlist",
+    );
+    tg_a.account_id = "main";
+    var tg_b = @import("channels/telegram.zig").TelegramChannel.init(
+        allocator,
+        "same-token",
+        &.{},
+        &.{},
+        "allowlist",
+    );
+    tg_b.account_id = "backup";
+
+    var sup_a = dispatch.spawnSupervisedChannel(tg_a.channel(), 5);
+    sup_a.recordSuccess();
+    const sup_b = dispatch.spawnSupervisedChannel(tg_b.channel(), 5);
+
+    var entries = [_]Entry{
+        .{
+            .name = "telegram",
+            .account_id = "main",
+            .channel = tg_a.channel(),
+            .listener_type = .polling,
+            .supervised = sup_a,
+            .thread = null,
+        },
+        .{
+            .name = "telegram",
+            .account_id = "backup",
+            .channel = tg_b.channel(),
+            .listener_type = .polling,
+            .supervised = sup_b,
+            .thread = null,
+        },
+    };
+
+    const desc = channel_adapters.findPollingDescriptor("telegram").?;
+    try std.testing.expect(ChannelManager.isPollingSourceDuplicate(allocator, &entries, 1, desc));
+}
+
+test "isPollingSourceDuplicate ignores distinct telegram source" {
+    const allocator = std.testing.allocator;
+
+    var tg_a = @import("channels/telegram.zig").TelegramChannel.init(
+        allocator,
+        "token-a",
+        &.{},
+        &.{},
+        "allowlist",
+    );
+    var tg_b = @import("channels/telegram.zig").TelegramChannel.init(
+        allocator,
+        "token-b",
+        &.{},
+        &.{},
+        "allowlist",
+    );
+
+    var sup_a = dispatch.spawnSupervisedChannel(tg_a.channel(), 5);
+    sup_a.recordSuccess();
+    const sup_b = dispatch.spawnSupervisedChannel(tg_b.channel(), 5);
+
+    var entries = [_]Entry{
+        .{
+            .name = "telegram",
+            .account_id = "main",
+            .channel = tg_a.channel(),
+            .listener_type = .polling,
+            .supervised = sup_a,
+            .thread = null,
+        },
+        .{
+            .name = "telegram",
+            .account_id = "backup",
+            .channel = tg_b.channel(),
+            .listener_type = .polling,
+            .supervised = sup_b,
+            .thread = null,
+        },
+    };
+
+    const desc = channel_adapters.findPollingDescriptor("telegram").?;
+    try std.testing.expect(!ChannelManager.isPollingSourceDuplicate(allocator, &entries, 1, desc));
 }
 
 test "ChannelManager init and deinit" {
@@ -723,8 +739,24 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
     const onebot_accounts = [_]@import("config_types.zig").OneBotConfig{
         .{ .account_id = "ob-main", .url = "ws://localhost:6700" },
     };
+    const mattermost_accounts = [_]@import("config_types.zig").MattermostConfig{
+        .{
+            .account_id = "mm-main",
+            .bot_token = "mm-token",
+            .base_url = "https://chat.example.com",
+            .allow_from = &.{"user-a"},
+            .group_policy = "allowlist",
+        },
+    };
+    const slack_allow = [_][]const u8{"slack-admin"};
     const slack_accounts = [_]@import("config_types.zig").SlackConfig{
-        .{ .account_id = "sl-main", .bot_token = "xoxb-token" },
+        .{
+            .account_id = "sl-main",
+            .bot_token = "xoxb-token",
+            .allow_from = &slack_allow,
+            .dm_policy = "deny",
+            .group_policy = "allowlist",
+        },
     };
     const maixcam_accounts = [_]@import("config_types.zig").MaixCamConfig{
         .{ .account_id = "cam-main", .name = "maixcam-main" },
@@ -740,23 +772,67 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
             .discord = &discord_accounts,
             .qq = &qq_accounts,
             .onebot = &onebot_accounts,
+            .mattermost = &mattermost_accounts,
             .slack = &slack_accounts,
             .maixcam = &maixcam_accounts,
-            .whatsapp = .{
-                .account_id = "wa-main",
-                .access_token = "wa-access",
-                .phone_number_id = "123456",
-                .verify_token = "wa-verify",
+            .whatsapp = &[_]@import("config_types.zig").WhatsAppConfig{
+                .{
+                    .account_id = "wa-main",
+                    .access_token = "wa-access",
+                    .phone_number_id = "123456",
+                    .verify_token = "wa-verify",
+                },
             },
-            .line = .{
-                .account_id = "line-main",
-                .access_token = "line-token",
-                .channel_secret = "line-secret",
+            .line = &[_]@import("config_types.zig").LineConfig{
+                .{
+                    .account_id = "line-main",
+                    .access_token = "line-token",
+                    .channel_secret = "line-secret",
+                },
             },
-            .lark = .{
-                .account_id = "lark-main",
-                .app_id = "cli_xxx",
-                .app_secret = "secret_xxx",
+            .lark = &[_]@import("config_types.zig").LarkConfig{
+                .{
+                    .account_id = "lark-main",
+                    .app_id = "cli_xxx",
+                    .app_secret = "secret_xxx",
+                },
+            },
+            .matrix = &[_]@import("config_types.zig").MatrixConfig{
+                .{
+                    .account_id = "mx-main",
+                    .homeserver = "https://matrix.example",
+                    .access_token = "mx-token",
+                    .room_id = "!room:example",
+                },
+            },
+            .irc = &[_]@import("config_types.zig").IrcConfig{
+                .{
+                    .account_id = "irc-main",
+                    .host = "irc.example.net",
+                    .nick = "nullclaw",
+                },
+            },
+            .imessage = &[_]@import("config_types.zig").IMessageConfig{
+                .{
+                    .account_id = "imain",
+                    .allow_from = &.{"user@example.com"},
+                    .enabled = true,
+                },
+            },
+            .email = &[_]@import("config_types.zig").EmailConfig{
+                .{
+                    .account_id = "email-main",
+                    .username = "bot@example.com",
+                    .password = "secret",
+                    .from_address = "bot@example.com",
+                },
+            },
+            .dingtalk = &[_]@import("config_types.zig").DingTalkConfig{
+                .{
+                    .account_id = "ding-main",
+                    .client_id = "ding-id",
+                    .client_secret = "ding-secret",
+                },
             },
         },
     };
@@ -772,14 +848,14 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
 
     try mgr.collectConfiguredChannels();
 
-    try std.testing.expectEqual(@as(usize, 11), mgr.count());
-    try std.testing.expectEqual(@as(usize, 11), reg.count());
+    try std.testing.expectEqual(@as(usize, 17), mgr.count());
+    try std.testing.expectEqual(@as(usize, 17), reg.count());
 
     const entries = mgr.channelEntries();
-    try std.testing.expectEqual(@as(usize, 3), countEntriesByListenerType(entries, .polling));
-    try std.testing.expectEqual(@as(usize, 3), countEntriesByListenerType(entries, .gateway_loop));
+    try std.testing.expectEqual(@as(usize, 4), countEntriesByListenerType(entries, .polling));
+    try std.testing.expectEqual(@as(usize, 7), countEntriesByListenerType(entries, .gateway_loop));
     try std.testing.expectEqual(@as(usize, 3), countEntriesByListenerType(entries, .webhook_only));
-    try std.testing.expectEqual(@as(usize, 2), countEntriesByListenerType(entries, .send_only));
+    try std.testing.expectEqual(@as(usize, 3), countEntriesByListenerType(entries, .send_only));
     try std.testing.expectEqual(@as(usize, 0), countEntriesByListenerType(entries, .not_implemented));
 
     try std.testing.expect(findEntryByNameAccount(entries, "telegram", "main") != null);
@@ -788,8 +864,17 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
     try std.testing.expect(findEntryByNameAccount(entries, "discord", "dc-main") != null);
     try std.testing.expect(findEntryByNameAccount(entries, "qq", "qq-main") != null);
     try std.testing.expect(findEntryByNameAccount(entries, "onebot", "ob-main") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "mattermost", "mm-main") != null);
     try std.testing.expect(findEntryByNameAccount(entries, "slack", "sl-main") != null);
     try std.testing.expect(findEntryByNameAccount(entries, "maixcam", "cam-main") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "whatsapp", "wa-main") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "line", "line-main") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "lark", "lark-main") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "matrix", "mx-main") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "irc", "irc-main") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "imessage", "imain") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "email", "email-main") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "dingtalk", "ding-main") != null);
 
     const discord_entry = findEntryByNameAccount(entries, "discord", "dc-main").?;
     const discord_ptr: *discord.DiscordChannel = @ptrCast(@alignCast(discord_entry.channel.ptr));
@@ -803,7 +888,27 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
     const onebot_ptr: *onebot.OneBotChannel = @ptrCast(@alignCast(onebot_entry.channel.ptr));
     try std.testing.expect(onebot_ptr.event_bus == &event_bus);
 
+    const mattermost_entry = findEntryByNameAccount(entries, "mattermost", "mm-main").?;
+    const mattermost_ptr: *mattermost.MattermostChannel = @ptrCast(@alignCast(mattermost_entry.channel.ptr));
+    try std.testing.expect(mattermost_ptr.bus == &event_bus);
+
+    const irc_entry = findEntryByNameAccount(entries, "irc", "irc-main").?;
+    const irc_ptr: *irc.IrcChannel = @ptrCast(@alignCast(irc_entry.channel.ptr));
+    try std.testing.expect(irc_ptr.bus == &event_bus);
+
+    const imessage_entry = findEntryByNameAccount(entries, "imessage", "imain").?;
+    const imessage_ptr: *imessage.IMessageChannel = @ptrCast(@alignCast(imessage_entry.channel.ptr));
+    try std.testing.expect(imessage_ptr.bus == &event_bus);
+
     const maixcam_entry = findEntryByNameAccount(entries, "maixcam", "cam-main").?;
     const maixcam_ptr: *maixcam.MaixCamChannel = @ptrCast(@alignCast(maixcam_entry.channel.ptr));
     try std.testing.expect(maixcam_ptr.event_bus == &event_bus);
+
+    const slack_entry = findEntryByNameAccount(entries, "slack", "sl-main").?;
+    const slack_ptr: *slack.SlackChannel = @ptrCast(@alignCast(slack_entry.channel.ptr));
+    try std.testing.expect(slack_ptr.bus == &event_bus);
+    try std.testing.expect(slack_ptr.policy.dm == .deny);
+    try std.testing.expect(slack_ptr.policy.group == .allowlist);
+    try std.testing.expectEqual(@as(usize, 1), slack_ptr.policy.allowlist.len);
+    try std.testing.expectEqualStrings("slack-admin", slack_ptr.policy.allowlist[0]);
 }

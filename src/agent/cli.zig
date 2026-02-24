@@ -39,6 +39,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     };
     defer cfg.deinit();
 
+    cfg.validate() catch |err| {
+        Config.printValidationError(err);
+        return;
+    };
+
     var out_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&out_buf);
     const w = &bw.interface;
@@ -80,6 +85,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     else
         null;
+    defer if (mcp_tools) |mt| allocator.free(mt);
 
     // Build security policy from config
     var tracker = security.RateTracker.init(allocator, cfg.autonomy.max_actions_per_hour);
@@ -96,12 +102,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .tracker = &tracker,
     };
 
-    // Resolve API key: config providers first, then env vars (ANTHROPIC_API_KEY, etc.)
-    const resolved_api_key = providers.resolveApiKeyFromConfig(
-        allocator,
-        cfg.default_provider,
-        cfg.providers,
-    ) catch null;
+    // Provider runtime bundle (primary provider + reliability wrapper).
+    var runtime_provider = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &cfg);
+    defer runtime_provider.deinit();
+    const resolved_api_key = runtime_provider.primaryApiKey();
 
     // Create tools (with agents config for delegate depth enforcement)
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
@@ -114,7 +118,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .allowed_paths = cfg.autonomy.allowed_paths,
         .policy = &policy,
     });
-    defer allocator.free(tools);
+    defer tools_mod.deinitTools(allocator, tools);
 
     // Create memory (optional — don't fail if it can't init)
     var mem_opt: ?Memory = null;
@@ -123,10 +127,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (memory_mod.createMemory(allocator, cfg.memory.backend, db_path)) |mem| {
         mem_opt = mem;
     } else |_| {}
+    defer if (mem_opt) |m| m.deinit();
 
-    // Create provider via centralized ProviderHolder (concrete struct lives on the stack)
-    var holder = providers.ProviderHolder.fromConfig(allocator, cfg.default_provider, resolved_api_key);
-    const provider_i: Provider = holder.provider();
+    // Bind memory backend once for this tool set before creating agents.
+    tools_mod.bindMemoryTools(tools, mem_opt);
+
+    // Provider interface from runtime bundle (includes retries/fallbacks).
+    const provider_i: Provider = runtime_provider.provider();
 
     const supports_streaming = provider_i.supportsStreaming();
 
@@ -140,6 +147,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
         var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
         agent.policy = &policy;
+        if (session_id) |sid| {
+            agent.memory_session_id = sid;
+        }
         defer agent.deinit();
 
         // Enable streaming if provider supports it
@@ -169,6 +179,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 
     // Interactive REPL mode
+    cfg.printModelConfig();
     try w.print("nullclaw Agent -- Interactive Mode\n", .{});
     try w.print("Provider: {s} | Model: {s}\n", .{
         cfg.default_provider,
@@ -217,6 +228,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
     agent.policy = &policy;
+    if (session_id) |sid| {
+        agent.memory_session_id = sid;
+    }
     defer agent.deinit();
 
     // Enable streaming if provider supports it

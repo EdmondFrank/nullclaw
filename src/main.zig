@@ -29,6 +29,7 @@ const Command = enum {
     migrate,
     models,
     auth,
+    update,
     help,
 };
 
@@ -51,6 +52,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "migrate", .migrate },
         .{ "models", .models },
         .{ "auth", .auth },
+        .{ "update", .update },
         .{ "help", .help },
         .{ "--help", .help },
         .{ "-h", .help },
@@ -99,6 +101,7 @@ pub fn main() !void {
         .migrate => try runMigrate(allocator, sub_args),
         .models => try runModels(allocator, sub_args),
         .auth => try runAuth(allocator, sub_args),
+        .update => try runUpdate(allocator, sub_args),
     }
 }
 
@@ -107,6 +110,27 @@ fn printVersion() void {
     var bw = std.fs.File.stdout().writer(&buf);
     bw.interface.print("nullclaw {s}\n", .{yc.version.string}) catch return;
     bw.interface.flush() catch return;
+}
+
+const GatewayDaemonOverrideError = error{InvalidPort};
+
+fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const u8) GatewayDaemonOverrideError!void {
+    var port: u16 = cfg.gateway.port;
+    var host: []const u8 = cfg.gateway.host;
+
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        if ((std.mem.eql(u8, sub_args[i], "--port") or std.mem.eql(u8, sub_args[i], "-p")) and i + 1 < sub_args.len) {
+            i += 1;
+            port = std.fmt.parseInt(u16, sub_args[i], 10) catch return error.InvalidPort;
+        } else if (std.mem.eql(u8, sub_args[i], "--host") and i + 1 < sub_args.len) {
+            i += 1;
+            host = sub_args[i];
+        }
+    }
+
+    cfg.gateway.port = port;
+    cfg.gateway.host = host;
 }
 
 // ── Gateway ──────────────────────────────────────────────────────
@@ -118,25 +142,17 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     };
     defer cfg.deinit();
 
-    // Config values are the baseline; CLI flags override them.
-    var port: u16 = cfg.gateway.port;
-    var host: []const u8 = cfg.gateway.host;
+    applyGatewayDaemonOverrides(&cfg, sub_args) catch {
+        std.debug.print("Invalid port in CLI args.\n", .{});
+        std.process.exit(1);
+    };
 
-    var i: usize = 0;
-    while (i < sub_args.len) : (i += 1) {
-        if ((std.mem.eql(u8, sub_args[i], "--port") or std.mem.eql(u8, sub_args[i], "-p")) and i + 1 < sub_args.len) {
-            i += 1;
-            port = std.fmt.parseInt(u16, sub_args[i], 10) catch {
-                std.debug.print("Invalid port: {s}\n", .{sub_args[i]});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, sub_args[i], "--host") and i + 1 < sub_args.len) {
-            i += 1;
-            host = sub_args[i];
-        }
-    }
+    cfg.validate() catch |err| {
+        yc.config.Config.printValidationError(err);
+        std.process.exit(1);
+    };
 
-    try yc.gateway.run(allocator, host, port, &cfg, null);
+    try yc.daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port);
 }
 
 // ── Daemon ───────────────────────────────────────────────────────
@@ -148,25 +164,17 @@ fn runDaemon(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     };
     defer cfg.deinit();
 
-    // Config values are the baseline; CLI flags override them.
-    var port: u16 = cfg.gateway.port;
-    var host: []const u8 = cfg.gateway.host;
+    applyGatewayDaemonOverrides(&cfg, sub_args) catch {
+        std.debug.print("Invalid port in CLI args.\n", .{});
+        std.process.exit(1);
+    };
 
-    var i: usize = 0;
-    while (i < sub_args.len) : (i += 1) {
-        if ((std.mem.eql(u8, sub_args[i], "--port") or std.mem.eql(u8, sub_args[i], "-p")) and i + 1 < sub_args.len) {
-            i += 1;
-            port = std.fmt.parseInt(u16, sub_args[i], 10) catch {
-                std.debug.print("Invalid port: {s}\n", .{sub_args[i]});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, sub_args[i], "--host") and i + 1 < sub_args.len) {
-            i += 1;
-            host = sub_args[i];
-        }
-    }
+    cfg.validate() catch |err| {
+        yc.config.Config.printValidationError(err);
+        std.process.exit(1);
+    };
 
-    try yc.daemon.run(allocator, &cfg, host, port);
+    try yc.daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port);
 }
 
 // ── Service ──────────────────────────────────────────────────────
@@ -676,6 +684,7 @@ fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 // Usage: nullclaw channel start [channel]
 // If a channel name is given, start that specific channel.
 // Otherwise, start the first available (Telegram first, then Signal).
+// To run all configured channels/accounts together, use `nullclaw gateway`.
 
 fn canStartFromChannelCommand(channel_id: yc.channel_catalog.ChannelId) bool {
     return switch (channel_id) {
@@ -714,11 +723,37 @@ fn dispatchChannelStart(
             std.debug.print("Signal channel is not configured.\n", .{});
             std.process.exit(1);
         },
+        .matrix => {
+            if (config.channels.matrixPrimary()) |mx_config| {
+                return runMatrixChannel(allocator, args, config, mx_config);
+            }
+            std.debug.print("Matrix channel is not configured.\n", .{});
+            std.process.exit(1);
+        },
         else => return runGatewayChannel(allocator, config, meta.key),
     }
 }
 
+fn hasConfiguredStartableChannels(config: *const yc.config.Config) bool {
+    for (yc.channel_catalog.known_channels) |meta| {
+        if (!canStartFromChannelCommand(meta.id)) continue;
+        if (yc.channel_catalog.isConfigured(config, meta.id)) return true;
+    }
+    return false;
+}
+
+fn printNoMessagingChannelConfiguredHint() void {
+    std.debug.print("No messaging channel configured. Add to config.json:\n", .{});
+    std.debug.print("  Telegram: {{\"channels\": {{\"telegram\": {{\"accounts\": {{\"main\": {{\"bot_token\": \"...\"}}}}}}}}\n", .{});
+    std.debug.print("  Signal:   {{\"channels\": {{\"signal\": {{\"accounts\": {{\"main\": {{\"http_url\": \"http://127.0.0.1:8080\", \"account\": \"+1234567890\"}}}}}}}}\n", .{});
+}
+
 fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len > 0 and std.mem.eql(u8, args[0], "--all")) {
+        std.debug.print("Use `nullclaw gateway` to start all configured channels/accounts.\n", .{});
+        std.process.exit(1);
+    }
+
     // Load config
     var config = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
@@ -726,20 +761,13 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     };
     defer config.deinit();
 
-    // Check which channels are configured
-    var has_any = false;
-    for (yc.channel_catalog.known_channels) |meta| {
-        if (!canStartFromChannelCommand(meta.id)) continue;
-        if (yc.channel_catalog.isConfigured(&config, meta.id)) {
-            has_any = true;
-            break;
-        }
-    }
+    config.validate() catch |err| {
+        yc.config.Config.printValidationError(err);
+        std.process.exit(1);
+    };
 
-    if (!has_any) {
-        std.debug.print("No messaging channel configured. Add to config.json:\n", .{});
-        std.debug.print("  Telegram: {{\"channels\": {{\"telegram\": {{\"accounts\": {{\"main\": {{\"bot_token\": \"...\"}}}}}}}}\n", .{});
-        std.debug.print("  Signal:   {{\"channels\": {{\"signal\": {{\"accounts\": {{\"main\": {{\"http_url\": \"http://127.0.0.1:8080\", \"account\": \"+1234567890\"}}}}}}}}\n", .{});
+    if (!hasConfiguredStartableChannels(&config)) {
+        printNoMessagingChannelConfiguredHint();
         std.process.exit(1);
     }
 
@@ -825,6 +853,29 @@ fn runGatewayChannel(allocator: std.mem.Allocator, config: *const yc.config.Conf
 
 // ── Signal Channel ─────────────────────────────────────────────────
 
+fn hasReliabilityCredentialFallback(allocator: std.mem.Allocator, config: *const yc.config.Config) bool {
+    for (config.reliability.api_keys) |raw_key| {
+        if (std.mem.trim(u8, raw_key, " \t\r\n").len > 0) return true;
+    }
+
+    for (config.reliability.fallback_providers) |provider_name| {
+        if (yc.providers.classifyProvider(provider_name) == .openai_codex_provider) return true;
+
+        const resolved = yc.providers.resolveApiKeyFromConfig(
+            allocator,
+            provider_name,
+            config.providers,
+        ) catch null;
+        defer if (resolved) |k| allocator.free(k);
+
+        if (resolved) |key| {
+            if (std.mem.trim(u8, key, " \t\r\n").len > 0) return true;
+        }
+    }
+
+    return false;
+}
+
 fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, config: *const yc.config.Config, signal_config: yc.config.SignalConfig) !void {
     _ = args;
 
@@ -834,21 +885,21 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         config.default_provider,
         config.providers,
     ) catch null;
+    defer if (resolved_api_key) |k| allocator.free(k);
 
     // OAuth providers (openai-codex) don't need an API key
     const provider_kind = yc.providers.classifyProvider(config.default_provider);
-    if (resolved_api_key == null and provider_kind != .openai_codex_provider) {
+    const has_fallback_credentials = hasReliabilityCredentialFallback(allocator, config);
+    if (resolved_api_key == null and provider_kind != .openai_codex_provider and !has_fallback_credentials) {
         std.debug.print("No API key configured. Set env var or add to ~/.nullclaw/config.json:\n", .{});
         std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
         std.process.exit(1);
     }
 
-    const model = config.default_model orelse "anthropic/claude-3.5-sonnet";
     const temperature = config.default_temperature;
 
     std.debug.print("nullclaw Signal bot starting...\n", .{});
-    std.debug.print("  Provider: {s}\n", .{config.default_provider});
-    std.debug.print("  Model: {s}\n", .{model});
+    config.printModelConfig();
     std.debug.print("  Temperature: {d:.1}\n", .{temperature});
     std.debug.print("  Signal URL: {s}\n", .{signal_config.http_url});
     std.debug.print("  Account: {s}\n", .{signal_config.account});
@@ -894,6 +945,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         signal_config.ignore_stories,
     );
     sg.group_policy = signal_config.group_policy;
+    sg.account_id = signal_config.account_id;
 
     // Verify health
     if (!sg.healthCheck()) {
@@ -912,6 +964,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         }
     else
         null;
+    defer if (mcp_tools) |mt| allocator.free(mt);
 
     // Build security policy from config
     const security = @import("nullclaw").security.policy;
@@ -941,7 +994,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .allowed_paths = config.autonomy.allowed_paths,
         .policy = &sec_policy,
     }) catch &.{};
-    defer if (tools.len > 0) allocator.free(tools);
+    defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
 
     if (mcp_tools) |mt| {
         std.debug.print("  MCP tools: {d}\n", .{mt.len});
@@ -956,10 +1009,12 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
             mem_opt = mem;
         } else |_| {}
     }
+    defer if (mem_opt) |m| m.deinit();
 
-    // Create provider
-    var holder = yc.providers.ProviderHolder.fromConfig(allocator, config.default_provider, resolved_api_key);
-    const provider_i = holder.provider();
+    // Create provider with reliability wrapper (retry + fallback chains).
+    var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, config);
+    defer runtime_provider.deinit();
+    const provider_i = runtime_provider.provider();
 
     // Create noop observer
     var noop_obs = yc.observability.NoopObserver{};
@@ -984,20 +1039,43 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         for (messages) |msg| {
             std.debug.print("[{s}] {s}: {s}\n", .{ msg.channel, msg.id, msg.content });
 
-            // Session key: include group context for isolation
-            const session_key = if (msg.is_group)
-                std.fmt.bufPrint(&key_buf, "signal:group:{s}:{s}", .{
-                    msg.reply_target orelse "unknown",
-                    msg.sender,
-                }) catch msg.sender
-            else
-                std.fmt.bufPrint(&key_buf, "signal:{s}", .{msg.sender}) catch msg.sender;
+            // Session key — resolve through route engine, fallback to legacy key.
+            const group_peer_id = yc.channels.signal.signalGroupPeerId(msg.reply_target);
+            var routed_session_key: ?[]const u8 = null;
+            defer if (routed_session_key) |key| allocator.free(key);
+            const session_key = blk: {
+                const route = yc.agent_routing.resolveRouteWithSession(
+                    allocator,
+                    .{
+                        .channel = "signal",
+                        .account_id = sg.account_id,
+                        .peer = .{
+                            .kind = if (msg.is_group) .group else .direct,
+                            .id = if (msg.is_group) group_peer_id else msg.sender,
+                        },
+                    },
+                    config.agent_bindings,
+                    config.agents,
+                    config.session,
+                ) catch break :blk if (msg.is_group)
+                    std.fmt.bufPrint(&key_buf, "signal:{s}:group:{s}:{s}", .{
+                        sg.account_id,
+                        group_peer_id,
+                        msg.sender,
+                    }) catch msg.sender
+                else
+                    std.fmt.bufPrint(&key_buf, "signal:{s}:{s}", .{ sg.account_id, msg.sender }) catch msg.sender;
+                allocator.free(route.main_session_key);
+                routed_session_key = route.session_key;
+                break :blk route.session_key;
+            };
 
             const reply = session_mgr.processMessage(session_key, msg.content) catch |err| {
                 std.debug.print("  Agent error: {}\n", .{err});
                 const err_msg = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
+                    error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
                     error.OutOfMemory => "Out of memory.",
                     else => "An error occurred. Try again or /new for a fresh session.",
                 };
@@ -1031,6 +1109,53 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     }
 }
 
+// ── Matrix Channel ────────────────────────────────────────────────
+
+fn runMatrixChannel(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    config: *const yc.config.Config,
+    matrix_config: yc.config.MatrixConfig,
+) !void {
+    _ = args;
+
+    var mx = yc.channels.matrix.MatrixChannel.initFromConfig(allocator, matrix_config);
+
+    std.debug.print("nullclaw Matrix bot starting...\n", .{});
+    std.debug.print("  Provider: {s}\n", .{config.default_provider});
+    std.debug.print("  Homeserver: {s}\n", .{mx.homeserver});
+    std.debug.print("  Account ID: {s}\n", .{mx.account_id});
+    std.debug.print("  Room: {s}\n", .{mx.room_id});
+    std.debug.print("  Group policy: {s}\n", .{mx.group_policy});
+    if (mx.group_allow_from.len == 0) {
+        std.debug.print("  Group allowed senders: (fallback to allow_from)\n", .{});
+    } else if (mx.group_allow_from.len == 1 and std.mem.eql(u8, mx.group_allow_from[0], "*")) {
+        std.debug.print("  Group allowed senders: *\n", .{});
+    } else {
+        std.debug.print("  Group allowed senders:", .{});
+        for (mx.group_allow_from) |entry| {
+            std.debug.print(" {s}", .{entry});
+        }
+        std.debug.print("\n", .{});
+    }
+
+    if (!mx.healthCheck()) {
+        std.debug.print("Matrix health check failed. Verify homeserver/access_token.\n", .{});
+        std.process.exit(1);
+    }
+
+    std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
+
+    const runtime = yc.channel_loop.ChannelRuntime.init(allocator, config) catch |err| {
+        std.debug.print("Runtime init failed: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer runtime.deinit();
+
+    var loop_state = yc.channel_loop.MatrixLoopState.init();
+    yc.channel_loop.runMatrixLoop(allocator, config, runtime, &loop_state, &mx);
+}
+
 // ── Telegram Channel ───────────────────────────────────────────────-
 
 fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, config: yc.config.Config, telegram_config: yc.config.TelegramConfig) !void {
@@ -1057,16 +1182,18 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         config.default_provider,
         config.providers,
     ) catch null;
+    defer if (resolved_api_key) |k| allocator.free(k);
 
     // OAuth providers (openai-codex) don't need an API key
     const provider_kind = yc.providers.classifyProvider(config.default_provider);
-    if (resolved_api_key == null and provider_kind != .openai_codex_provider) {
+    const has_fallback_credentials = hasReliabilityCredentialFallback(allocator, &config);
+    if (resolved_api_key == null and provider_kind != .openai_codex_provider and !has_fallback_credentials) {
         std.debug.print("No API key configured. Set env var or add to ~/.nullclaw/config.json:\n", .{});
         std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
         std.process.exit(1);
     }
 
-    const model = config.default_model orelse "anthropic/claude-3.5-sonnet";
+    const model = config.default_model.?;
     const temperature = config.default_temperature;
 
     std.debug.print("nullclaw telegram bot starting...\n", .{});
@@ -1087,6 +1214,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
 
     var tg = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed, telegram_config.group_allow_from, telegram_config.group_policy);
     tg.proxy = telegram_config.proxy;
+    tg.account_id = telegram_config.account_id;
 
     // Set up transcription — key comes from providers.{audio_media.provider}
     const trans = config.audio_media;
@@ -1100,6 +1228,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         };
         break :blk wt;
     } else null;
+    defer if (whisper_ptr) |wt| allocator.destroy(wt);
     if (whisper_ptr) |wt| tg.transcriber = wt.transcriber();
 
     // Initialize MCP tools from config
@@ -1110,6 +1239,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         }
     else
         null;
+    defer if (mcp_tools) |mt| allocator.free(mt);
 
     // Build security policy from config
     const security = @import("nullclaw").security.policy;
@@ -1139,7 +1269,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .allowed_paths = config.autonomy.allowed_paths,
         .policy = &sec_policy,
     }) catch &.{};
-    defer if (tools.len > 0) allocator.free(tools);
+    defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
 
     if (mcp_tools) |mt| {
         std.debug.print("  MCP tools: {d}\n", .{mt.len});
@@ -1154,14 +1284,16 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
             mem_opt = mem;
         } else |_| {}
     }
+    defer if (mem_opt) |m| m.deinit();
 
     // Create noop observer
     var noop_obs = yc.observability.NoopObserver{};
     const obs = noop_obs.observer();
 
-    // Create provider vtable — concrete struct must stay alive for the loop.
-    var holder = yc.providers.ProviderHolder.fromConfig(allocator, config.default_provider, resolved_api_key);
-    const provider_i: yc.providers.Provider = holder.provider();
+    // Create provider with reliability wrapper (retry + fallback chains).
+    var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &config);
+    defer runtime_provider.deinit();
+    const provider_i: yc.providers.Provider = runtime_provider.provider();
 
     std.debug.print("  Tools: {d} loaded\n", .{tools.len});
     std.debug.print("  Memory: {s}\n", .{if (mem_opt != null) "enabled" else "disabled"});
@@ -1206,9 +1338,29 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
             const use_reply_to = msg.is_group or telegram_config.reply_in_private;
             const reply_to_id: ?i64 = if (use_reply_to) msg.message_id else null;
 
-            // Session key: "telegram:{chat_id}"
+            // Session key — resolve through route engine, fallback to legacy key.
             var key_buf: [128]u8 = undefined;
-            const session_key = std.fmt.bufPrint(&key_buf, "telegram:{s}", .{msg.sender}) catch msg.sender;
+            var routed_session_key: ?[]const u8 = null;
+            defer if (routed_session_key) |key| allocator.free(key);
+            const session_key = blk: {
+                const route = yc.agent_routing.resolveRouteWithSession(
+                    allocator,
+                    .{
+                        .channel = "telegram",
+                        .account_id = tg.account_id,
+                        .peer = .{
+                            .kind = if (msg.is_group) .group else .direct,
+                            .id = msg.sender,
+                        },
+                    },
+                    config.agent_bindings,
+                    config.agents,
+                    config.session,
+                ) catch break :blk std.fmt.bufPrint(&key_buf, "telegram:{s}:{s}", .{ tg.account_id, msg.sender }) catch msg.sender;
+                allocator.free(route.main_session_key);
+                routed_session_key = route.session_key;
+                break :blk route.session_key;
+            };
 
             // Start periodic typing indicator while LLM is thinking
             typing.start(msg.sender);
@@ -1219,6 +1371,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
                 const err_msg = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
+                    error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
                     error.OutOfMemory => "Out of memory.",
                     else => "An error occurred. Try again or /new for a fresh session.",
                 };
@@ -1240,10 +1393,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         if (messages.len > 0) {
             // Free message memory
             for (messages) |msg| {
-                allocator.free(msg.id);
-                allocator.free(msg.sender);
-                allocator.free(msg.content);
-                if (msg.first_name) |fn_| allocator.free(fn_);
+                msg.deinit(allocator);
             }
             allocator.free(messages);
         }
@@ -1329,6 +1479,30 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         printAuthUsage();
         std.process.exit(1);
     }
+}
+
+// ── Update ─────────────────────────────────────────────────────────
+
+fn runUpdate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    var opts = yc.update.Options{ .check_only = false, .yes = false };
+
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        if (std.mem.eql(u8, sub_args[i], "--check")) {
+            opts.check_only = true;
+        } else if (std.mem.eql(u8, sub_args[i], "--yes")) {
+            opts.yes = true;
+        } else {
+            std.debug.print("Unknown option: {s}\n", .{sub_args[i]});
+            std.debug.print("Usage: nullclaw update [--check] [--yes]\n", .{});
+            std.process.exit(1);
+        }
+    }
+
+    yc.update.run(allocator, opts) catch |err| {
+        std.debug.print("Update failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
 }
 
 fn printAuthUsage() void {
@@ -1514,7 +1688,7 @@ fn runAuthImportCodex(
             std.debug.print("  Token: expired (will auto-refresh)\n", .{});
         }
     }
-    std.debug.print("\nTo use: set \"default_provider\": \"openai-codex\" in ~/.nullclaw/config.json\n", .{});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/gpt-5.3-codex\" in ~/.nullclaw/config.json\n", .{});
 }
 
 /// Decode the "exp" claim from a JWT, returning the Unix timestamp or 0 if not decodable.
@@ -1568,7 +1742,7 @@ fn saveAndPrintResult(
     } else {
         std.debug.print("Authenticated successfully.\n", .{});
     }
-    std.debug.print("\nTo use: set \"default_provider\": \"openai-codex\" in ~/.nullclaw/config.json\n", .{});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/gpt-5.3-codex\" in ~/.nullclaw/config.json\n", .{});
 }
 
 fn printUsage() void {
@@ -1594,6 +1768,7 @@ fn printUsage() void {
         \\  migrate     Migrate data from other agent runtimes
         \\  models      Manage provider model catalogs
         \\  auth        Manage OAuth authentication (OpenAI Codex)
+        \\  update      Check for and install updates
         \\  help        Show this help
         \\
         \\OPTIONS:
@@ -1610,6 +1785,7 @@ fn printUsage() void {
         \\  migrate openclaw [--dry-run] [--source PATH]
         \\  models refresh
         \\  auth <login|status|logout> <provider> [--import-codex]
+        \\  update [--check] [--yes]
         \\
     ;
     std.debug.print("{s}", .{usage});
@@ -1625,5 +1801,76 @@ test "parse known commands" {
     try std.testing.expectEqual(.migrate, parseCommand("migrate").?);
     try std.testing.expectEqual(.models, parseCommand("models").?);
     try std.testing.expectEqual(.auth, parseCommand("auth").?);
+    try std.testing.expectEqual(.update, parseCommand("update").?);
     try std.testing.expect(parseCommand("unknown") == null);
+}
+
+test "applyGatewayDaemonOverrides applies CLI port before validation" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+    };
+    cfg.gateway.port = 0;
+
+    const args = [_][]const u8{ "--port", "8080" };
+    try applyGatewayDaemonOverrides(&cfg, &args);
+
+    try std.testing.expectEqual(@as(u16, 8080), cfg.gateway.port);
+    try cfg.validate();
+}
+
+test "applyGatewayDaemonOverrides applies host override" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+    };
+    const args = [_][]const u8{ "--host", "0.0.0.0" };
+    try applyGatewayDaemonOverrides(&cfg, &args);
+    try std.testing.expectEqualStrings("0.0.0.0", cfg.gateway.host);
+}
+
+test "applyGatewayDaemonOverrides rejects invalid port" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+    };
+    const args = [_][]const u8{ "--port", "bad" };
+    try std.testing.expectError(error.InvalidPort, applyGatewayDaemonOverrides(&cfg, &args));
+}
+
+test "hasConfiguredStartableChannels ignores cli and webhook-only defaults" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .cli = true,
+            .webhook = .{ .port = 8080 },
+        },
+    };
+
+    try std.testing.expect(!hasConfiguredStartableChannels(&cfg));
+}
+
+test "hasConfiguredStartableChannels returns true when telegram configured" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .telegram = &[_]yc.config.TelegramConfig{
+                .{ .account_id = "main", .bot_token = "123:abc" },
+            },
+        },
+    };
+
+    try std.testing.expect(hasConfiguredStartableChannels(&cfg));
 }

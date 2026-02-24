@@ -1,5 +1,6 @@
 const std = @import("std");
 const root = @import("root.zig");
+const config_types = @import("../config_types.zig");
 
 /// WhatsApp channel — uses WhatsApp Business Cloud API.
 /// Operates in webhook mode (push-based); messages received via gateway endpoint.
@@ -32,6 +33,18 @@ pub const WhatsAppChannel = struct {
             .group_allow_from = group_allow_from,
             .group_policy = group_policy,
         };
+    }
+
+    pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.WhatsAppConfig) WhatsAppChannel {
+        return init(
+            allocator,
+            cfg.access_token,
+            cfg.phone_number_id,
+            cfg.verify_token,
+            cfg.allow_from,
+            cfg.group_allow_from,
+            cfg.group_policy,
+        );
     }
 
     pub fn channelName(_: *WhatsAppChannel) []const u8 {
@@ -104,19 +117,23 @@ pub const WhatsAppChannel = struct {
                     var phone_buf: [32]u8 = undefined;
                     const normalized = normalizePhone(&phone_buf, from);
 
-                    // Check allowlist
-                    if (!self.isNumberAllowed(normalized)) continue;
-
                     // Check group policy
                     const is_group_msg = if (msg_obj.get("context")) |ctx|
                         if (ctx == .object) (ctx.object.get("group_jid") != null) else false
                     else
                         false;
 
-                    if (is_group_msg) {
+                    if (!is_group_msg) {
+                        if (self.allow_from.len > 0 and !self.isNumberAllowed(normalized)) continue;
+                    } else {
                         if (std.mem.eql(u8, self.group_policy, "disabled")) continue;
                         if (!std.mem.eql(u8, self.group_policy, "open")) {
-                            if (self.group_allow_from.len > 0 and !root.isAllowed(self.group_allow_from, normalized)) continue;
+                            const effective_allow_from = if (self.group_allow_from.len > 0)
+                                self.group_allow_from
+                            else
+                                self.allow_from;
+                            if (effective_allow_from.len == 0) continue;
+                            if (!root.isAllowed(effective_allow_from, normalized)) continue;
                         }
                     }
 
@@ -357,6 +374,18 @@ test "whatsapp parse empty payload" {
     try std.testing.expectEqual(@as(usize, 0), msgs.len);
 }
 
+test "whatsapp parse invalid shapes returns empty" {
+    const allocator = std.testing.allocator;
+    const nums = [_][]const u8{"*"};
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
+    const payload =
+        \\{"entry":[{"changes":[{"value":{"messages":[{"from":42,"text":"oops"}]}}]}]}
+    ;
+    const msgs = try ch.parseWebhookPayload(allocator, payload);
+    defer allocator.free(msgs);
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
 test "whatsapp parse valid text message" {
     const allocator = std.testing.allocator;
     const nums = [_][]const u8{"+1234567890"};
@@ -388,6 +417,57 @@ test "whatsapp parse unauthorized number filtered" {
 
     const payload =
         \\{"entry":[{"changes":[{"value":{"messages":[{"from":"9999999999","timestamp":"1","type":"text","text":{"body":"Spam"}}]}}]}]}
+    ;
+
+    const msgs = try ch.parseWebhookPayload(allocator, payload);
+    defer allocator.free(msgs);
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
+test "whatsapp group open bypasses allow_from" {
+    const allocator = std.testing.allocator;
+    const nums = [_][]const u8{"+1234567890"};
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "open");
+    const payload =
+        \\{"entry":[{"changes":[{"value":{"messages":[{"from":"9999999999","timestamp":"1","type":"text","context":{"group_jid":"1203630@g.us"},"text":{"body":"Group hello"}}]}}]}]}
+    ;
+
+    const msgs = try ch.parseWebhookPayload(allocator, payload);
+    defer {
+        for (msgs) |*m| {
+            var mm = m.*;
+            mm.deinit(allocator);
+        }
+        allocator.free(msgs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    try std.testing.expectEqualStrings("Group hello", msgs[0].content);
+}
+
+test "whatsapp group allowlist falls back to allow_from" {
+    const allocator = std.testing.allocator;
+    const nums = [_][]const u8{"+1111111111"};
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
+    const payload =
+        \\{"entry":[{"changes":[{"value":{"messages":[{"from":"1111111111","timestamp":"1","type":"text","context":{"group_jid":"1203630@g.us"},"text":{"body":"Allowed in group"}}]}}]}]}
+    ;
+
+    const msgs = try ch.parseWebhookPayload(allocator, payload);
+    defer {
+        for (msgs) |*m| {
+            var mm = m.*;
+            mm.deinit(allocator);
+        }
+        allocator.free(msgs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+}
+
+test "whatsapp group allowlist blocks when allowlists are empty" {
+    const allocator = std.testing.allocator;
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &.{}, &.{}, "allowlist");
+    const payload =
+        \\{"entry":[{"changes":[{"value":{"messages":[{"from":"1111111111","timestamp":"1","type":"text","context":{"group_jid":"1203630@g.us"},"text":{"body":"Blocked in group"}}]}}]}]}
     ;
 
     const msgs = try ch.parseWebhookPayload(allocator, payload);

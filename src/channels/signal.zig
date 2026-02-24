@@ -35,6 +35,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
+const config_types = @import("../config_types.zig");
 
 const log = std.log.scoped(.signal);
 
@@ -44,6 +45,17 @@ const log = std.log.scoped(.signal);
 
 /// Prefix used to identify group targets in reply_target strings.
 pub const GROUP_TARGET_PREFIX = "group:";
+
+/// Extract a stable group peer ID from reply_target.
+/// For non-group targets returns the raw target or "unknown".
+pub fn signalGroupPeerId(reply_target: ?[]const u8) []const u8 {
+    const target = reply_target orelse "unknown";
+    if (std.mem.startsWith(u8, target, GROUP_TARGET_PREFIX)) {
+        const raw = target[GROUP_TARGET_PREFIX.len..];
+        if (raw.len > 0) return raw;
+    }
+    return target;
+}
 
 /// Health check endpoint for the signal-cli daemon.
 const SIGNAL_HEALTH_ENDPOINT = "/api/v1/check";
@@ -81,6 +93,7 @@ pub const RecipientTarget = union(enum) {
 /// dispatch loop calling `pollMessages()`.
 pub const SignalChannel = struct {
     allocator: std.mem.Allocator,
+    account_id: []const u8 = "default",
     /// Base URL of the signal-cli daemon (e.g. "http://127.0.0.1:8080").
     /// Trailing slashes are stripped on init.
     http_url: []const u8,
@@ -117,6 +130,21 @@ pub const SignalChannel = struct {
             .ignore_attachments = ignore_attachments,
             .ignore_stories = ignore_stories,
         };
+    }
+
+    pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.SignalConfig) SignalChannel {
+        var ch = init(
+            allocator,
+            cfg.http_url,
+            cfg.account,
+            cfg.allow_from,
+            cfg.group_allow_from,
+            cfg.ignore_attachments,
+            cfg.ignore_stories,
+        );
+        ch.account_id = cfg.account_id;
+        ch.group_policy = cfg.group_policy;
+        return ch;
     }
 
     pub fn channelName(_: *const SignalChannel) []const u8 {
@@ -182,7 +210,12 @@ pub const SignalChannel = struct {
     /// - Empty list = use allow_from fallback for group sender checks.
     /// - `*` = allow all group senders.
     pub fn isGroupSenderAllowed(self: *const SignalChannel, sender: []const u8) bool {
-        return root.isAllowed(self.group_allow_from, sender);
+        if (self.group_allow_from.len == 0) return false;
+        for (self.group_allow_from) |entry| {
+            if (std.mem.eql(u8, entry, "*")) return true;
+            if (std.mem.eql(u8, normalizeAllowEntry(entry), normalizeAllowEntry(sender))) return true;
+        }
+        return false;
     }
 
     // ── Envelope Processing ─────────────────────────────────────────
@@ -215,9 +248,15 @@ pub const SignalChannel = struct {
         // Skip attachment-only messages when configured.
         if (self.ignore_attachments and dm_attachment_ids.len > 0 and !has_message_text) return null;
 
-        // Effective sender: prefer source_number (E.164), fall back to source (UUID).
+        // Effective sender for reply target: prefer source_number (E.164), fall back to source (UUID).
         const sender_raw = source_number orelse source orelse return null;
         if (sender_raw.len == 0) return null;
+        const sender_alt = blk: {
+            if (source) |src| {
+                if (!std.mem.eql(u8, src, sender_raw)) break :blk src;
+            }
+            break :blk null;
+        };
 
         // Group/DM policy checks.
         if (dm_group_id != null) {
@@ -226,14 +265,17 @@ pub const SignalChannel = struct {
             if (!std.mem.eql(u8, self.group_policy, "open")) {
                 // Allowlist mode: check group_allow_from for sender, fall back to allow_from.
                 const group_allowed = if (self.group_allow_from.len > 0)
-                    self.isGroupSenderAllowed(sender_raw)
+                    self.isGroupSenderAllowed(sender_raw) or
+                        (if (sender_alt) |alt| self.isGroupSenderAllowed(alt) else false)
                 else
-                    self.isSenderAllowed(sender_raw);
+                    self.isSenderAllowed(sender_raw) or
+                        (if (sender_alt) |alt| self.isSenderAllowed(alt) else false);
                 if (!group_allowed) return null;
             }
         } else {
             // DM context: check allow_from
-            if (!self.isSenderAllowed(sender_raw)) return null;
+            if (!(self.isSenderAllowed(sender_raw) or
+                (if (sender_alt) |alt| self.isSenderAllowed(alt) else false))) return null;
         }
 
         // Determine message text and fetch attachments.
@@ -962,6 +1004,22 @@ test "group sender allowlist filtering" {
         true,
     );
     try std.testing.expect(ch.isGroupSenderAllowed("+15550001111"));
+    try std.testing.expect(!ch.isGroupSenderAllowed("+15550002222"));
+}
+
+test "group sender allowlist supports uuid-prefixed entries" {
+    const uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+    const senders = [_][]const u8{"uuid:" ++ uuid};
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &.{},
+        &senders,
+        true,
+        true,
+    );
+    try std.testing.expect(ch.isGroupSenderAllowed(uuid));
     try std.testing.expect(!ch.isGroupSenderAllowed("+15550002222"));
 }
 
@@ -1721,6 +1779,38 @@ test "process envelope group accepted when sender in group_allow_from" {
     try std.testing.expect(m2.is_group);
 }
 
+test "process envelope group accepts uuid allowlist when source_number is present" {
+    const uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+    const users = [_][]const u8{"*"};
+    const group_users = [_][]const u8{"uuid:" ++ uuid};
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &users,
+        &group_users,
+        true,
+        true,
+    );
+
+    const msg = try ch.processEnvelope(
+        std.testing.allocator,
+        uuid, // source (UUID)
+        "+1111111111", // source_number present
+        null,
+        1000,
+        false,
+        "hi",
+        1000,
+        "group123",
+        &.{},
+    );
+    try std.testing.expect(msg != null);
+    const m = msg.?;
+    defer m.deinit(std.testing.allocator);
+    try std.testing.expect(m.is_group);
+}
+
 test "process envelope group sender not in group_allow_from" {
     const users = [_][]const u8{"*"};
     const group_users = [_][]const u8{"+2222222222"};
@@ -2116,6 +2206,48 @@ test "process envelope sender none when both missing" {
         &.{},
     );
     try std.testing.expect(msg == null);
+}
+
+test "parseSSEEnvelope returns owned message content" {
+    const users = [_][]const u8{"*"};
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &users,
+        &.{},
+        true,
+        true,
+    );
+
+    const raw_json =
+        \\{
+        \\  "envelope": {
+        \\    "source": "uuid-123",
+        \\    "sourceNumber": "+1111111111",
+        \\    "timestamp": 1700000000,
+        \\    "dataMessage": {
+        \\      "message": "hello from sse",
+        \\      "timestamp": 1700000001
+        \\    }
+        \\  }
+        \\}
+    ;
+    const json_buf = try std.testing.allocator.dupe(u8, raw_json);
+    defer std.testing.allocator.free(json_buf);
+
+    const msg_opt = try ch.parseSSEEnvelope(json_buf);
+    try std.testing.expect(msg_opt != null);
+    const msg = msg_opt.?;
+    defer msg.deinit(std.testing.allocator);
+
+    @memset(json_buf, 'x');
+    const churn = try std.testing.allocator.alloc(u8, 2048);
+    defer std.testing.allocator.free(churn);
+    @memset(churn, 'z');
+
+    try std.testing.expectEqualStrings("hello from sse", msg.content);
+    try std.testing.expectEqualStrings("+1111111111", msg.sender);
 }
 
 // ── Vtable Tests ────────────────────────────────────────────────────
