@@ -248,6 +248,65 @@ pub const LarkChannel = struct {
     /// Send a message to a Lark chat via the Open API.
     /// POST /im/v1/messages?receive_id_type=chat_id
     /// On 401, invalidates cached token and retries once.
+    /// Result of a single send attempt
+    const SendResult = enum {
+        success,
+        should_retry,
+        fatal_error,
+    };
+
+    /// Attempt to send message once. Returns SendResult to indicate whether to retry.
+    fn trySendOnce(self: *LarkChannel, url: []const u8, body: []const u8) !SendResult {
+        const token = self.getTenantAccessToken() catch |err| {
+            log.err("Failed to get tenant access token: {}", .{err});
+            return .should_retry;
+        };
+        defer self.allocator.free(token);
+
+        // Build auth header
+        var auth_buf: [512]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        try auth_fbs.writer().print("Bearer {s}", .{token});
+        const auth_value = auth_fbs.getWritten();
+
+        var client = std.http.Client{ .allocator = self.allocator };
+        defer client.deinit();
+
+        const send_result = client.fetch(.{
+            .location = .{ .url = url },
+            .method = .POST,
+            .payload = body,
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
+                .{ .name = "Authorization", .value = auth_value },
+            },
+        }) catch |err| {
+            log.err("Lark API POST failed: {}", .{err});
+            log.err("Request details - URL: {s}", .{url});
+            log.err("Request details - Body: {s}", .{body});
+            log.err("Request details - Auth: {s}", .{auth_value});
+            return .should_retry;
+        };
+
+        if (send_result.status == .ok) {
+            return .success;
+        }
+
+        // Handle non-OK status
+        if (send_result.status == .unauthorized) {
+            log.warn("Lark token expired (401), invalidating token", .{});
+            self.invalidateToken();
+            return .should_retry;
+        }
+
+        log.err("Lark API POST returned status {}", .{send_result.status});
+        log.err("Response details - Status: {}", .{send_result.status});
+        log.err("Response details - URL: {s}", .{url});
+        log.err("Response details - Body: {s}", .{body});
+        log.err("Response details - Auth: {s}", .{auth_value});
+        return .should_retry;
+    }
+
     pub fn sendMessage(self: *LarkChannel, recipient: []const u8, text: []const u8) !void {
         const base = self.apiBase();
 
@@ -282,68 +341,22 @@ pub const LarkChannel = struct {
         var attempt: u8 = 0;
         while (attempt < 3) : (attempt += 1) {
             log.info("Lark send attempt {d}/3", .{attempt + 1});
-            
-            // Get fresh token for each attempt (handles token expiration)
-            const token = self.getTenantAccessToken() catch |err| {
-                log.err("Failed to get tenant access token on attempt {d}: {}", .{attempt + 1, err});
-                if (attempt == 2) return error.LarkApiError; // Last attempt failed
-                std.Thread.sleep(1000 * 1000 * 1000); // 1 second delay
-                continue;
-            };
-            defer self.allocator.free(token);
 
-            // Build auth header
-            var auth_buf: [512]u8 = undefined;
-            var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-            try auth_fbs.writer().print("Bearer {s}", .{token});
-            const auth_value = auth_fbs.getWritten();
-
-            var client = std.http.Client{ .allocator = self.allocator };
-            defer client.deinit();
-
-            const send_result = client.fetch(.{
-                .location = .{ .url = url },
-                .method = .POST,
-                .payload = body,
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
-                    .{ .name = "Authorization", .value = auth_value },
+            const result = try self.trySendOnce(url, body);
+            switch (result) {
+                .success => {
+                    log.info("Lark message sent successfully on attempt {d}", .{attempt + 1});
+                    return;
                 },
-            }) catch |err| {
-                log.err("Lark API POST failed on attempt {d}: {}", .{attempt + 1, err});
-                log.err("Request details - URL: {s}", .{url});
-                log.err("Request details - Body: {s}", .{body});
-                log.err("Request details - Auth: {s}", .{auth_value});
-                if (attempt == 2) return error.LarkApiError; // Last attempt failed
-                std.Thread.sleep(1000 * 1000 * 1000); // 1 second delay
-                continue;
-            };
-
-            if (send_result.status == .ok) {
-                log.info("Lark message sent successfully on attempt {d}", .{attempt + 1});
-                return;
+                .should_retry => {
+                    if (attempt == 2) {
+                        log.err("All 3 attempts failed, giving up", .{});
+                        return error.LarkApiError;
+                    }
+                    std.Thread.sleep(1000 * 1000 * 1000); // 1 second delay
+                },
+                .fatal_error => return error.LarkApiError,
             }
-
-            // Handle non-OK status
-            if (send_result.status == .unauthorized) {
-                log.warn("Lark token expired (401) on attempt {d}, invalidating token", .{attempt + 1});
-                self.invalidateToken();
-            } else {
-                log.err("Lark API POST returned status {d} on attempt {d}", .{@intFromEnum(send_result.status), attempt + 1});
-                log.err("Response details - Status: {}", .{send_result.status});
-                log.err("Response details - URL: {s}", .{url});
-                log.err("Response details - Body: {s}", .{body});
-                log.err("Response details - Auth: {s}", .{auth_value});
-            }
-
-            // If this is the last attempt, return error
-            if (attempt == 2) {
-                log.err("All 3 attempts failed, giving up", .{});
-                return error.LarkApiError;
-            }
-
-            // Wait before next retry (except for last attempt)
-            std.Thread.sleep(1000 * 1000 * 1000); // 1 second delay
         }
 
         // This should never be reached, but just in case
