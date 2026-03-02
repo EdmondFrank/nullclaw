@@ -455,16 +455,23 @@ pub fn build(b: *std.Build) void {
     else
         &.{.{ .name = "nullclaw", .module = lib_mod.? }};
 
-    const exe = b.addExecutable(.{
-        .name = "nullclaw",
-        .root_module = b.createModule(.{
-            .root_source_file = if (is_wasi) b.path("src/main_wasi.zig") else b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = exe_imports,
-        }),
-        .linkage = if (is_static) .static else .dynamic,
+    const exe_root_module = b.createModule(.{
+        .root_source_file = if (is_wasi) b.path("src/main_wasi.zig") else b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = exe_imports,
     });
+    const exe = if (is_static)
+        b.addExecutable(.{
+            .name = "nullclaw",
+            .root_module = exe_root_module,
+            .linkage = .static,
+        })
+    else
+        b.addExecutable(.{
+            .name = "nullclaw",
+            .root_module = exe_root_module,
+        });
     exe.root_module.addImport("build_options", build_options_module);
 
     // Link SQLite on the compile step (not the module)
