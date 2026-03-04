@@ -21,6 +21,7 @@ const channel_adapters = @import("channel_adapters.zig");
 const heartbeat_mod = @import("heartbeat.zig");
 const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
+const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 
 const log = std.log.scoped(.daemon);
 
@@ -494,6 +495,21 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
     return parsed;
 }
 
+fn buildInboundConversationContext(msg: *const bus_mod.InboundMessage, meta: channel_adapters.InboundMetadata) ConversationContext {
+    const has_group_hint = meta.is_group != null or meta.peer_kind != null;
+    const is_group_value = meta.is_group orelse if (meta.peer_kind) |kind| kind == .group else false;
+    const group_id = if (is_group_value)
+        (meta.peer_id orelse if (msg.chat_id.len > 0) msg.chat_id else null)
+    else
+        null;
+
+    return .{
+        .channel = msg.channel,
+        .is_group = if (has_group_hint) is_group_value else null,
+        .group_id = group_id,
+    };
+}
+
 fn resolveInboundRouteSessionKeyWithMetadata(
     allocator: std.mem.Allocator,
     config: *const Config,
@@ -700,11 +716,12 @@ fn inboundDispatcherThread(
             .account_id = outbound_account_id,
             .chat_id = msg.chat_id,
         };
+        const conversation_context: ?ConversationContext = buildInboundConversationContext(&msg, parsed_meta.fields);
 
         const reply = runtime.session_mgr.processMessageStreaming(
             session_key,
             msg.content,
-            null,
+            conversation_context,
             if (use_streaming_outbound)
                 streaming.Sink{
                     .callback = publishStreamingChunk,
@@ -1647,6 +1664,39 @@ test "parseInboundMetadata extracts message_id and thread_id" {
     try std.testing.expectEqualStrings("C1", parsed.fields.channel_id.?);
     try std.testing.expectEqualStrings("1700.1", parsed.fields.message_id.?);
     try std.testing.expectEqualStrings("1700.0", parsed.fields.thread_id.?);
+}
+
+test "buildInboundConversationContext keeps channel when metadata is absent" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "whatsapp_web",
+        .sender_id = "5511999999999",
+        .chat_id = "5511999999999",
+        .content = "oi",
+        .session_key = "whatsapp_web:default:direct:5511999999999",
+    };
+
+    const ctx = buildInboundConversationContext(&msg, .{});
+    try std.testing.expectEqualStrings("whatsapp_web", ctx.channel.?);
+    try std.testing.expect(ctx.is_group == null);
+    try std.testing.expect(ctx.group_id == null);
+}
+
+test "buildInboundConversationContext derives group details from metadata" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "whatsapp_web",
+        .sender_id = "5511888888888",
+        .chat_id = "120363000000000000@g.us",
+        .content = "oi grupo",
+        .session_key = "whatsapp_web:default:group:120363000000000000@g.us",
+    };
+
+    const ctx = buildInboundConversationContext(&msg, .{
+        .peer_kind = .group,
+        .peer_id = "120363000000000000@g.us",
+    });
+    try std.testing.expect(ctx.is_group != null);
+    try std.testing.expect(ctx.is_group.?);
+    try std.testing.expectEqualStrings("120363000000000000@g.us", ctx.group_id.?);
 }
 
 test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" {
