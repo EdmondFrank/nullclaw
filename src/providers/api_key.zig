@@ -85,6 +85,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "opencode", .{ "OPENCODE_API_KEY", "", "" } },
         .{ "opencode-zen", .{ "OPENCODE_API_KEY", "", "" } },
         .{ "minimax", .{ "MINIMAX_API_KEY", "", "" } },
+        .{ "exhub", .{ "EXHUB_API_KEY", "", "" } },
         .{ "qwen", .{ "DASHSCOPE_API_KEY", "", "" } },
         .{ "dashscope", .{ "DASHSCOPE_API_KEY", "", "" } },
         .{ "qianfan", .{ "QIANFAN_ACCESS_KEY", "", "" } },
