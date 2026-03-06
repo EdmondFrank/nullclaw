@@ -110,6 +110,7 @@ const all_integrations_list = [_]IntegrationEntry{
     .{ .name = "Z.AI", .description = "Z.AI inference", .category = .ai_model, .status = .available },
     .{ .name = "GLM", .description = "ChatGLM / Zhipu models", .category = .ai_model, .status = .available },
     .{ .name = "MiniMax", .description = "MiniMax AI models", .category = .ai_model, .status = .available },
+    .{ .name = "Exhub", .description = "Exhub AI models", .category = .ai_model, .status = .available },
     .{ .name = "Amazon Bedrock", .description = "AWS managed model access", .category = .ai_model, .status = .available },
     .{ .name = "Qianfan", .description = "Baidu AI models", .category = .ai_model, .status = .available },
     .{ .name = "Groq", .description = "Ultra-fast LPU inference", .category = .ai_model, .status = .available },

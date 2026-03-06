@@ -111,6 +111,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "synthetic", .label = "Synthetic", .default_model = "synthetic-model", .env_var = "SYNTHETIC_API_KEY" },
     .{ .key = "opencode-zen", .label = "OpenCode Zen", .default_model = "opencode-model", .env_var = "OPENCODE_API_KEY" },
     .{ .key = "minimax", .label = "MiniMax", .default_model = "minimax-m2.1", .env_var = "MINIMAX_API_KEY" },
+    .{ .key = "exhub", .label = "ExHub", .default_model = "kimi-k2.5", .env_var = "EXHUB_API_KEY" },
 
     // --- Tier 5: Cloud gateways ---
     .{ .key = "qwen", .label = "Qwen (Alibaba)", .default_model = "qwen-3-max", .env_var = "DASHSCOPE_API_KEY" },
