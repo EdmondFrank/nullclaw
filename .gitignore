@@ -25,3 +25,4 @@ config.signal.json
 .cursor/
 .trae/
 .codebuddy/
+.cecli*
