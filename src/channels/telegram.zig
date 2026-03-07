@@ -3008,7 +3008,7 @@ fn mergeConsecutiveMessages(
 
     var i: usize = 0;
     while (i < messages.items.len) {
-        _ = messages.items[i].message_id orelse {
+        const mid1 = messages.items[i].message_id orelse {
             i += 1;
             continue;
         };
@@ -3023,9 +3023,13 @@ fn mergeConsecutiveMessages(
             if (std.mem.eql(u8, messages.items[i].sender, messages.items[j].sender) and
                 std.mem.eql(u8, messages.items[i].id, messages.items[j].id))
             {
-                if (messages.items[j].message_id) |_| {
+                if (messages.items[j].message_id) |mid2| {
                     if (!isSlashCommandMessage(messages.items[j].content)) {
-                        found_idx = j;
+                        const split_like = messages.items[i].content.len >= TEXT_SPLIT_LIKELY_MIN_LEN or
+                            messages.items[j].content.len >= TEXT_SPLIT_LIKELY_MIN_LEN;
+                        if (mid2 == mid1 + 1 or split_like) {
+                            found_idx = j;
+                        }
                     }
                 }
                 break; // Found the next message from this user, consecutive or not.
@@ -4411,7 +4415,7 @@ test "telegram shouldDebounceTextMessage debounces medium chunk (~900 bytes)" {
     try std.testing.expect(shouldDebounceTextMessage(&ch, msg));
 }
 
-test "telegram mergeConsecutiveMessages merges non-consecutive ids for same sender/chat" {
+test "telegram mergeConsecutiveMessages does not merge short non-consecutive ids" {
     const alloc = std.testing.allocator;
     var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
     defer {
@@ -4436,13 +4440,52 @@ test "telegram mergeConsecutiveMessages merges non-consecutive ids for same send
         .content = try alloc.dupe(u8, "Second"),
         .channel = "telegram",
         .timestamp = 0,
-        .message_id = 15, // Gap in ids should still merge for rapid-fire coalescing
+        .message_id = 15,
+    });
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqualStrings("First", messages.items[0].content);
+    try std.testing.expectEqualStrings("Second", messages.items[1].content);
+}
+
+test "telegram mergeConsecutiveMessages merges split-like non-consecutive ids for same sender/chat" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer {
+        for (messages.items) |msg| {
+            var tmp = msg;
+            tmp.deinit(alloc);
+        }
+        messages.deinit(alloc);
+    }
+
+    const split_like = try alloc.alloc(u8, TEXT_SPLIT_LIKELY_MIN_LEN);
+    @memset(split_like, 'x');
+
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "chat1"),
+        .content = split_like,
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = 10,
+    });
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "chat1"),
+        .content = try alloc.dupe(u8, "tail"),
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = 15,
     });
 
     mergeConsecutiveMessages(alloc, &messages);
 
     try std.testing.expectEqual(@as(usize, 1), messages.items.len);
-    try std.testing.expectEqualStrings("First\nSecond", messages.items[0].content);
+    try std.testing.expect(std.mem.startsWith(u8, messages.items[0].content, "xxxx"));
+    try std.testing.expect(std.mem.endsWith(u8, messages.items[0].content, "\ntail"));
 }
 
 test "telegram mergeConsecutiveMessages allocation failure does not leak" {
