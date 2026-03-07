@@ -2038,66 +2038,32 @@ pub const TelegramChannel = struct {
             return;
         };
 
-        const from_obj = callback_query.object.get("from") orelse return;
-        if (from_obj != .object) return;
-        const username_val = from_obj.object.get("username");
-        const username = if (username_val) |uv| (if (uv == .string) uv.string else "unknown") else "unknown";
-        var user_id_buf: [32]u8 = undefined;
-        const user_id: ?[]const u8 = blk_uid: {
-            const id_val = from_obj.object.get("id") orelse break :blk_uid null;
-            if (id_val != .integer) break :blk_uid null;
-            break :blk_uid std.fmt.bufPrint(&user_id_buf, "{d}", .{id_val.integer}) catch null;
-        };
-        const clicker_identity = if (!std.mem.eql(u8, username, "unknown"))
-            username
-        else
-            (user_id orelse "unknown");
+        var sender_scratch: telegram_update_ingress.IdentityScratch = .{};
+        const clicker = telegram_update_ingress.callbackSender(callback_query, &sender_scratch) orelse return;
 
-        const msg_obj = callback_query.object.get("message") orelse {
-            self.answerCallbackQuery(cb_id, "Button has no message context");
-            return;
-        };
-        if (msg_obj != .object) {
+        if (telegram_update_ingress.callbackMessage(callback_query) == null) {
             self.answerCallbackQuery(cb_id, "Button has no message context");
             return;
         }
 
-        const chat_obj = msg_obj.object.get("chat") orelse return;
-        if (chat_obj != .object) return;
-        const chat_id_val = chat_obj.object.get("id") orelse return;
-        var chat_id_buf: [32]u8 = undefined;
-        const chat_id_str = if (chat_id_val == .integer)
-            (std.fmt.bufPrint(&chat_id_buf, "{d}", .{chat_id_val.integer}) catch return)
-        else
+        var chat_scratch: telegram_update_ingress.IdentityScratch = .{};
+        const chat = telegram_update_ingress.callbackMessageContext(callback_query, &chat_scratch) orelse {
+            self.answerCallbackQuery(cb_id, "Button has no message context");
             return;
+        };
 
-        const chat_type_val = chat_obj.object.get("type");
-        const is_group = if (chat_type_val) |tv|
-            (if (tv == .string) (!std.mem.eql(u8, tv.string, "private")) else false)
-        else
-            false;
-
-        if (!self.isAuthorizedIdentity(is_group, username, user_id)) {
-            log.warn("ignoring callback from unauthorized user: username={s}, user_id={s}", .{
-                username,
-                user_id orelse "unknown",
-            });
+        if (!self.isAuthorizedIdentity(chat.is_group, clicker.username, clicker.user_id)) {
+            logUnauthorizedCallback(clicker);
             self.answerCallbackQuery(cb_id, "You are not allowed to use this button");
             return;
         }
-
-        const first_name_val = from_obj.object.get("first_name");
-        const first_name: ?[]const u8 = if (first_name_val) |fnv| (if (fnv == .string) fnv.string else null) else null;
-
-        const msg_id_val = msg_obj.object.get("message_id");
-        const msg_id: ?i64 = if (msg_id_val) |mv| (if (mv == .integer) mv.integer else null) else null;
 
         const selection = self.consumeCallbackSelection(
             allocator,
             parsed_cb.token,
             parsed_cb.option_id,
-            clicker_identity,
-            chat_id_str,
+            clicker.preferred_identity,
+            chat.chat_id,
         ) catch |err| {
             log.warn("telegram consumeCallbackSelection failed: {}", .{err});
             self.answerCallbackQuery(cb_id, "Failed to handle button");
@@ -2110,14 +2076,14 @@ pub const TelegramChannel = struct {
                 defer allocator.free(ok.submit_text);
 
                 if (ok.remove_on_click) {
-                    if (ok.message_id orelse msg_id) |bot_msg_id| {
-                        self.editMessageReplyMarkupClear(chat_id_str, bot_msg_id);
+                    if (ok.message_id orelse chat.message_id) |bot_msg_id| {
+                        self.editMessageReplyMarkupClear(chat.chat_id, bot_msg_id);
                     }
                 }
 
-                const id_dup = allocator.dupe(u8, clicker_identity) catch return;
+                const id_dup = allocator.dupe(u8, clicker.preferred_identity) catch return;
                 errdefer allocator.free(id_dup);
-                const sender_dup = allocator.dupe(u8, chat_id_str) catch {
+                const sender_dup = allocator.dupe(u8, chat.chat_id) catch {
                     allocator.free(id_dup);
                     return;
                 };
@@ -2128,7 +2094,7 @@ pub const TelegramChannel = struct {
                     return;
                 };
                 errdefer allocator.free(content_dup);
-                const fn_dup: ?[]const u8 = if (first_name) |fn_|
+                const fn_dup: ?[]const u8 = if (clicker.first_name) |fn_|
                     (allocator.dupe(u8, fn_) catch {
                         allocator.free(id_dup);
                         allocator.free(sender_dup);
@@ -2144,9 +2110,9 @@ pub const TelegramChannel = struct {
                     .content = content_dup,
                     .channel = "telegram",
                     .timestamp = root.nowEpochSecs(),
-                    .message_id = msg_id,
+                    .message_id = chat.message_id,
                     .first_name = fn_dup,
-                    .is_group = is_group,
+                    .is_group = chat.is_group,
                 }) catch {
                     allocator.free(id_dup);
                     allocator.free(sender_dup);
@@ -2179,253 +2145,15 @@ pub const TelegramChannel = struct {
         media_group_ids: *std.ArrayListUnmanaged(?[]const u8),
     ) void {
         if (update != .object) return;
-        // Advance offset
-        if (update.object.get("update_id")) |uid| {
-            if (uid == .integer) {
-                self.last_update_id = uid.integer + 1;
-            }
-        }
+        self.advanceLastUpdateOffset(update);
 
-        if (update.object.get("callback_query")) |cbq| {
+        if (telegram_update_ingress.callbackQuery(update)) |cbq| {
             self.processCallbackQueryUpdate(allocator, cbq, messages, media_group_ids);
             return;
         }
 
-        const message = update.object.get("message") orelse return;
-        if (message != .object) return;
-
-        // Get sender info — check both @username and numeric user_id
-        const from_obj = message.object.get("from") orelse return;
-        if (from_obj != .object) return;
-        const username_val = from_obj.object.get("username");
-        const username = if (username_val) |uv| (if (uv == .string) uv.string else "unknown") else "unknown";
-
-        var user_id_buf: [32]u8 = undefined;
-        const user_id: ?[]const u8 = blk_uid: {
-            const id_val = from_obj.object.get("id") orelse break :blk_uid null;
-            if (id_val != .integer) break :blk_uid null;
-            break :blk_uid std.fmt.bufPrint(&user_id_buf, "{d}", .{id_val.integer}) catch null;
-        };
-
-        // Get chat_id and chat type
-        const chat_obj = message.object.get("chat") orelse return;
-        if (chat_obj != .object) return;
-        const chat_id_val = chat_obj.object.get("id") orelse return;
-        var chat_id_buf: [32]u8 = undefined;
-        const chat_id_str = if (chat_id_val == .integer)
-            (std.fmt.bufPrint(&chat_id_buf, "{d}", .{chat_id_val.integer}) catch return)
-        else
-            return;
-        const chat_type_val = chat_obj.object.get("type");
-        const is_group = if (chat_type_val) |tv|
-            (if (tv == .string) (!std.mem.eql(u8, tv.string, "private")) else false)
-        else
-            false;
-
-        if (!self.isAuthorizedIdentity(is_group, username, user_id)) {
-            log.warn("ignoring message from unauthorized user: username={s}, user_id={s}", .{
-                username,
-                user_id orelse "unknown",
-            });
-            return;
-        }
-
-        // Check if bot should process this message (require_mention logic)
-        if (!self.shouldProcessMessage(message)) {
-            log.info("ignoring message: require_mention enabled but bot not mentioned", .{});
-            return;
-        }
-
-        const sender_identity = if (!std.mem.eql(u8, username, "unknown"))
-            username
-        else
-            (user_id orelse "unknown");
-
-        const first_name_val = from_obj.object.get("first_name");
-        const first_name: ?[]const u8 = if (first_name_val) |fnv| (if (fnv == .string) fnv.string else null) else null;
-
-        const msg_id_val = message.object.get("message_id");
-        const msg_id: ?i64 = if (msg_id_val) |mv| (if (mv == .integer) mv.integer else null) else null;
-
-        // Check for voice/audio messages and attempt transcription
-        const content = blk_content: {
-            const voice_obj = message.object.get("voice") orelse message.object.get("audio");
-            if (voice_obj) |vobj| {
-                if (vobj != .object) break :blk_content null;
-                const file_id_val = vobj.object.get("file_id") orelse break :blk_content null;
-                const file_id = if (file_id_val == .string) file_id_val.string else break :blk_content null;
-
-                if (voice.transcribeTelegramVoice(allocator, self.bot_token, file_id, self.transcriber)) |transcribed| {
-                    defer allocator.free(transcribed);
-                    var result: std.ArrayListUnmanaged(u8) = .empty;
-                    result.appendSlice(allocator, "[Voice]: ") catch break :blk_content null;
-                    result.appendSlice(allocator, transcribed) catch {
-                        result.deinit(allocator);
-                        break :blk_content null;
-                    };
-                    break :blk_content result.toOwnedSlice(allocator) catch {
-                        result.deinit(allocator);
-                        break :blk_content null;
-                    };
-                }
-                break :blk_content null;
-            }
-
-            // Check for photo messages
-            if (message.object.get("photo")) |photo_val| {
-                if (photo_val == .array and photo_val.array.items.len > 0) {
-                    const last_photo = photo_val.array.items[photo_val.array.items.len - 1];
-                    if (last_photo == .object) {
-                        const photo_fid_val = last_photo.object.get("file_id") orelse break :blk_content null;
-                        const photo_fid = if (photo_fid_val == .string) photo_fid_val.string else break :blk_content null;
-
-                        if (downloadTelegramPhoto(allocator, self.bot_token, photo_fid, self.proxy)) |local_path| {
-                            var result: std.ArrayListUnmanaged(u8) = .empty;
-                            result.appendSlice(allocator, "[IMAGE:") catch {
-                                allocator.free(local_path);
-                                break :blk_content null;
-                            };
-                            result.appendSlice(allocator, local_path) catch {
-                                allocator.free(local_path);
-                                result.deinit(allocator);
-                                break :blk_content null;
-                            };
-                            result.appendSlice(allocator, "]") catch {
-                                allocator.free(local_path);
-                                result.deinit(allocator);
-                                break :blk_content null;
-                            };
-                            allocator.free(local_path);
-                            if (message.object.get("caption")) |cap_val| {
-                                if (cap_val == .string) {
-                                    result.appendSlice(allocator, " ") catch {};
-                                    result.appendSlice(allocator, cap_val.string) catch {};
-                                }
-                            }
-                            break :blk_content result.toOwnedSlice(allocator) catch {
-                                result.deinit(allocator);
-                                break :blk_content null;
-                            };
-                        }
-                    }
-                }
-            }
-
-            // Check for document messages
-            if (message.object.get("document")) |doc_val| {
-                if (doc_val == .object) {
-                    const doc_fid_val = doc_val.object.get("file_id") orelse break :blk_content null;
-                    const doc_fid = if (doc_fid_val == .string) doc_fid_val.string else break :blk_content null;
-                    const doc_fname: ?[]const u8 = if (doc_val.object.get("file_name")) |fn_val|
-                        (if (fn_val == .string) fn_val.string else null)
-                    else
-                        null;
-
-                    if (downloadTelegramFile(allocator, self.bot_token, doc_fid, doc_fname, self.proxy)) |local_path| {
-                        var result: std.ArrayListUnmanaged(u8) = .empty;
-                        result.appendSlice(allocator, "[FILE:") catch {
-                            allocator.free(local_path);
-                            break :blk_content null;
-                        };
-                        result.appendSlice(allocator, local_path) catch {
-                            allocator.free(local_path);
-                            result.deinit(allocator);
-                            break :blk_content null;
-                        };
-                        result.appendSlice(allocator, "]") catch {
-                            allocator.free(local_path);
-                            result.deinit(allocator);
-                            break :blk_content null;
-                        };
-                        allocator.free(local_path);
-                        if (message.object.get("caption")) |cap_val| {
-                            if (cap_val == .string) {
-                                result.appendSlice(allocator, " ") catch {};
-                                result.appendSlice(allocator, cap_val.string) catch {};
-                            }
-                        }
-                        break :blk_content result.toOwnedSlice(allocator) catch {
-                            result.deinit(allocator);
-                            break :blk_content null;
-                        };
-                    }
-                }
-            }
-
-            break :blk_content null;
-        };
-
-        // Fall back to text content if no voice/photo/document content.
-        // If text is absent (e.g. document/photo upload failure), use caption.
-        const final_content = content orelse blk_text: {
-            if (message.object.get("text")) |text_val| {
-                if (text_val == .string) {
-                    break :blk_text allocator.dupe(u8, text_val.string) catch return;
-                }
-            }
-            if (message.object.get("caption")) |cap_val| {
-                if (cap_val == .string) {
-                    break :blk_text allocator.dupe(u8, cap_val.string) catch return;
-                }
-            }
-            return;
-        };
-
-        // Extract media_group_id
-        const media_group_id: ?[]const u8 = blk_mg: {
-            const mg_val = message.object.get("media_group_id") orelse break :blk_mg null;
-            break :blk_mg if (mg_val == .string) mg_val.string else null;
-        };
-
-        const id_dup = allocator.dupe(u8, sender_identity) catch {
-            allocator.free(final_content);
-            return;
-        };
-        const sender_dup = allocator.dupe(u8, chat_id_str) catch {
-            allocator.free(final_content);
-            allocator.free(id_dup);
-            return;
-        };
-        const fn_dup: ?[]const u8 = if (first_name) |fn_|
-            (allocator.dupe(u8, fn_) catch {
-                allocator.free(final_content);
-                allocator.free(id_dup);
-                allocator.free(sender_dup);
-                return;
-            })
-        else
-            null;
-
-        messages.append(allocator, .{
-            .id = id_dup,
-            .sender = sender_dup,
-            .content = final_content,
-            .channel = "telegram",
-            .timestamp = root.nowEpochSecs(),
-            .message_id = msg_id,
-            .first_name = fn_dup,
-            .is_group = is_group,
-        }) catch {
-            allocator.free(final_content);
-            allocator.free(id_dup);
-            allocator.free(sender_dup);
-            if (fn_dup) |f| allocator.free(f);
-            return;
-        };
-
-        // Track media_group_id for merging
-        const mg_dup: ?[]const u8 = if (media_group_id) |mgid|
-            (allocator.dupe(u8, mgid) catch null)
-        else
-            null;
-        media_group_ids.append(allocator, mg_dup) catch {
-            // Rollback to keep messages and media_group_ids synchronized
-            const popped = messages.pop().?;
-            var tmp = popped;
-            tmp.deinit(allocator);
-            if (mg_dup) |m| allocator.free(m);
-            return;
-        };
+        const message = telegram_update_ingress.updateMessage(update) orelse return;
+        self.processMessageUpdate(allocator, message, messages, media_group_ids);
     }
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
