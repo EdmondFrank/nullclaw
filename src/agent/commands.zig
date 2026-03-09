@@ -16,17 +16,11 @@ const control_plane = @import("../control_plane.zig");
 const version = @import("../version.zig");
 
 const SlashCommand = control_plane.SlashCommand;
+const parseSlashCommand = control_plane.parseSlashCommand;
+const isSlashName = control_plane.isSlashName;
 
 pub const BARE_SESSION_RESET_PROMPT =
     "A new session was started via /new or /reset. Execute your Session Startup sequence now - read the required files before responding to the user. Then greet the user in your configured persona, if one is provided. Be yourself - use your defined voice, mannerisms, and mood. Keep it to 1-3 sentences and ask what they want to do. If the runtime model differs from default_model in the system prompt, mention the default model. Do not mention internal steps, files, tools, or reasoning.";
-
-fn parseSlashCommand(message: []const u8) ?SlashCommand {
-    return control_plane.parseSlashCommand(message);
-}
-
-fn isSlashName(cmd: SlashCommand, expected: []const u8) bool {
-    return control_plane.isSlashName(cmd, expected);
-}
 
 pub fn bareSessionResetPrompt(message: []const u8) ?[]const u8 {
     const cmd = parseSlashCommand(message) orelse return null;
@@ -225,18 +219,6 @@ test "configPrimaryModelForSelection keeps explicit configured custom provider p
     const primary = try configPrimaryModelForSelection(&dummy, "customgw/model-a");
     defer allocator.free(primary);
     try std.testing.expectEqualStrings("customgw/model-a", primary);
-}
-
-test "parseSlashCommand strips bot mention from command name" {
-    const parsed = parseSlashCommand("/model@nullclaw_bot openrouter/inception/mercury") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("model", parsed.name);
-    try std.testing.expectEqualStrings("openrouter/inception/mercury", parsed.arg);
-}
-
-test "parseSlashCommand strips bot mention with colon separator" {
-    const parsed = parseSlashCommand("/model@nullclaw_bot: gpt-5.2") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("model", parsed.name);
-    try std.testing.expectEqualStrings("gpt-5.2", parsed.arg);
 }
 
 test "bareSessionResetPrompt returns prompt for bare /new" {

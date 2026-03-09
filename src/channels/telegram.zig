@@ -16,12 +16,6 @@ const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.telegram);
 const MEDIA_GROUP_FLUSH_SECS: u64 = 3;
-const TEXT_MESSAGE_DEBOUNCE_SECS: u64 = telegram_ingress.TEXT_MESSAGE_DEBOUNCE_SECS;
-const LARGE_TEXT_CHAIN_DEBOUNCE_SECS: u64 = telegram_ingress.LARGE_TEXT_CHAIN_DEBOUNCE_SECS;
-const LARGE_TEXT_CHAIN_MIN_PARTS: usize = telegram_ingress.LARGE_TEXT_CHAIN_MIN_PARTS;
-const LARGE_TEXT_CHAIN_MIN_BYTES: usize = telegram_ingress.LARGE_TEXT_CHAIN_MIN_BYTES;
-// Debounce medium+ chunks so rapid-fire split messages get coalesced.
-const TEXT_SPLIT_LIKELY_MIN_LEN: usize = telegram_ingress.TEXT_SPLIT_LIKELY_MIN_LEN;
 const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
 const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
 const TELEGRAM_BOT_COMMANDS_JSON = control_plane.TELEGRAM_BOT_COMMANDS_JSON;
@@ -279,25 +273,6 @@ fn nextPendingMediaDeadline(group_ids: []const ?[]const u8, received_at: []const
         seen = true;
     }
     return if (seen) next_deadline else null;
-}
-
-const PendingTextChainStats = telegram_ingress.PendingTextChainStats;
-
-fn pendingTextChainStatsForKey(
-    id: []const u8,
-    sender: []const u8,
-    pending_messages: []const root.ChannelMessage,
-    received_at: []const u64,
-) ?PendingTextChainStats {
-    return telegram_ingress.pendingTextChainStatsForKey(id, sender, pending_messages, received_at);
-}
-
-fn textDebounceSecsForChain(parts: usize, total_bytes: usize) u64 {
-    return telegram_ingress.textDebounceSecsForChain(parts, total_bytes);
-}
-
-fn nextPendingTextDeadline(pending_messages: []const root.ChannelMessage, received_at: []const u64) ?u64 {
-    return telegram_ingress.nextPendingTextDeadline(pending_messages, received_at);
 }
 
 fn sweepTempMediaFilesInDir(dir_path: []const u8, now_secs: i64, ttl_secs: i64) void {
@@ -1839,7 +1814,7 @@ pub const TelegramChannel = struct {
             if (nextPendingMediaDeadline(self.pending_media_group_ids.items, self.pending_media_received_at.items)) |deadline| {
                 next_deadline = deadline;
             }
-            if (nextPendingTextDeadline(self.pending_text_messages.items, self.pending_text_received_at.items)) |deadline| {
+            if (telegram_ingress.nextPendingTextDeadline(self.pending_text_messages.items, self.pending_text_received_at.items)) |deadline| {
                 if (next_deadline == null or deadline < next_deadline.?) next_deadline = deadline;
             }
 
@@ -1966,7 +1941,12 @@ pub const TelegramChannel = struct {
         {
             var i: usize = 0;
             while (i < messages.items.len) {
-                if (!shouldDebounceTextMessage(self, messages.items[i])) {
+                if (!telegram_ingress.shouldDebounceTextMessage(
+                    root.nowEpochSecs(),
+                    self.pending_text_messages.items,
+                    self.pending_text_received_at.items,
+                    messages.items[i],
+                )) {
                     // Explicitly cancel stale chain fragments for this sender/chat
                     // so a fresh message is not blocked by old pending chunks.
                     self.cancelPendingTextChainForKey(messages.items[i].id, messages.items[i].sender);
@@ -2005,7 +1985,7 @@ pub const TelegramChannel = struct {
 
         // Merge consecutive text messages to reconstruct long split texts
         // and debounce rapid-fire messages.
-        mergeConsecutiveMessages(allocator, &messages);
+        telegram_ingress.mergeConsecutiveMessages(allocator, &messages);
 
         // toOwnedSlice MUST run before manual deinit to avoid double-free via errdefer
         const final_messages = try messages.toOwnedSlice(allocator);
@@ -2568,30 +2548,6 @@ fn appendHtmlEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Alloca
 // ════════════════════════════════════════════════════════════════════════════
 // Telegram Photo Download
 // ════════════════════════════════════════════════════════════════════════════
-
-/// Merge consecutive text messages from the same sender in the same chat.
-/// This acts as a debouncer for rapid-fire messages and automatically reassembles
-/// long texts that were split by the Telegram client (which splits at 4096 chars).
-/// Handles interleaving of messages from different chats.
-fn isSlashCommandMessage(content: []const u8) bool {
-    return telegram_ingress.isSlashCommandMessage(content);
-}
-
-fn shouldDebounceTextMessage(self: *const TelegramChannel, msg: root.ChannelMessage) bool {
-    return telegram_ingress.shouldDebounceTextMessage(
-        root.nowEpochSecs(),
-        self.pending_text_messages.items,
-        self.pending_text_received_at.items,
-        msg,
-    );
-}
-
-fn mergeConsecutiveMessages(
-    allocator: std.mem.Allocator,
-    messages: *std.ArrayListUnmanaged(root.ChannelMessage),
-) void {
-    telegram_ingress.mergeConsecutiveMessages(allocator, messages);
-}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Media Group Merging
@@ -3542,462 +3498,6 @@ test "telegram mergeMediaGroups interleaved items" {
     }
 }
 
-test "telegram mergeConsecutiveMessages handles interleaved chats" {
-    const alloc = std.testing.allocator;
-    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
-    defer {
-        for (messages.items) |msg| {
-            var tmp = msg;
-            tmp.deinit(alloc);
-        }
-        messages.deinit(alloc);
-    }
-
-    // Chat 1, part 1
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "Part 1"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 10,
-    });
-    // Chat 2, isolated message
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user2"),
-        .sender = try alloc.dupe(u8, "chat2"),
-        .content = try alloc.dupe(u8, "Hello from chat 2"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 50,
-    });
-    // Chat 1, part 2
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "Part 2"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 11,
-    });
-
-    mergeConsecutiveMessages(alloc, &messages);
-
-    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
-    try std.testing.expectEqualStrings("Part 1\nPart 2", messages.items[0].content);
-    try std.testing.expectEqual(@as(i64, 11), messages.items[0].message_id.?);
-    try std.testing.expectEqualStrings("Hello from chat 2", messages.items[1].content);
-}
-
-test "telegram mergeConsecutiveMessages stops at interleaved sender in same chat" {
-    const alloc = std.testing.allocator;
-    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
-    defer {
-        for (messages.items) |msg| {
-            var tmp = msg;
-            tmp.deinit(alloc);
-        }
-        messages.deinit(alloc);
-    }
-
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "Part 1"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 10,
-    });
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user2"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "Interrupting reply"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 11,
-    });
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "Part 2"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 12,
-    });
-
-    mergeConsecutiveMessages(alloc, &messages);
-
-    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
-    try std.testing.expectEqualStrings("Part 1", messages.items[0].content);
-    try std.testing.expectEqualStrings("Interrupting reply", messages.items[1].content);
-    try std.testing.expectEqualStrings("Part 2", messages.items[2].content);
-}
-
-test "telegram mergeConsecutiveMessages skips commands" {
-    const alloc = std.testing.allocator;
-    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
-    defer {
-        for (messages.items) |msg| {
-            var tmp = msg;
-            tmp.deinit(alloc);
-        }
-        messages.deinit(alloc);
-    }
-
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "/help"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 10,
-    });
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "some text"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 11,
-    });
-
-    mergeConsecutiveMessages(alloc, &messages);
-
-    // Command should NOT be merged
-    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
-    try std.testing.expectEqualStrings("/help", messages.items[0].content);
-    try std.testing.expectEqualStrings("some text", messages.items[1].content);
-}
-
-test "telegram mergeConsecutiveMessages skips whitespace-padded commands" {
-    const alloc = std.testing.allocator;
-    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
-    defer {
-        for (messages.items) |msg| {
-            var tmp = msg;
-            tmp.deinit(alloc);
-        }
-        messages.deinit(alloc);
-    }
-
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, " \t/help"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 10,
-    });
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "some text"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 11,
-    });
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "\n/new"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 12,
-    });
-
-    mergeConsecutiveMessages(alloc, &messages);
-
-    // Commands should stay isolated even with leading whitespace/newline.
-    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
-    try std.testing.expectEqualStrings(" \t/help", messages.items[0].content);
-    try std.testing.expectEqualStrings("some text", messages.items[1].content);
-    try std.testing.expectEqualStrings("\n/new", messages.items[2].content);
-}
-
-test "telegram mergeConsecutiveMessages chain merges three parts" {
-    const alloc = std.testing.allocator;
-    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
-    defer {
-        for (messages.items) |msg| {
-            var tmp = msg;
-            tmp.deinit(alloc);
-        }
-        messages.deinit(alloc);
-    }
-
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "A"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 1,
-    });
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "B"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 2,
-    });
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "C"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 3,
-    });
-
-    mergeConsecutiveMessages(alloc, &messages);
-
-    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
-    try std.testing.expectEqualStrings("A\nB\nC", messages.items[0].content);
-    try std.testing.expectEqual(@as(i64, 3), messages.items[0].message_id.?);
-}
-
-test "telegram mergeConsecutiveMessages single message no-op" {
-    const alloc = std.testing.allocator;
-    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
-    defer {
-        for (messages.items) |msg| {
-            var tmp = msg;
-            tmp.deinit(alloc);
-        }
-        messages.deinit(alloc);
-    }
-
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "Hello"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 42,
-    });
-
-    mergeConsecutiveMessages(alloc, &messages);
-
-    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
-    try std.testing.expectEqualStrings("Hello", messages.items[0].content);
-}
-
-test "telegram shouldDebounceTextMessage handles long chunk and active chain" {
-    const alloc = std.testing.allocator;
-    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
-    defer {
-        ch.resetPendingTextBuffers();
-        ch.pending_text_messages.deinit(alloc);
-        ch.pending_text_received_at.deinit(alloc);
-    }
-
-    const now = root.nowEpochSecs();
-    const long_content = try alloc.alloc(u8, TEXT_SPLIT_LIKELY_MIN_LEN);
-    defer alloc.free(long_content);
-    @memset(long_content, 'x');
-
-    const long_msg: root.ChannelMessage = .{
-        .id = "user-a",
-        .sender = "chat-a",
-        .content = long_content,
-        .channel = "telegram",
-        .timestamp = now,
-        .message_id = 1,
-    };
-    try std.testing.expect(shouldDebounceTextMessage(&ch, long_msg));
-
-    const short_msg: root.ChannelMessage = .{
-        .id = "user-a",
-        .sender = "chat-a",
-        .content = "short",
-        .channel = "telegram",
-        .timestamp = now,
-        .message_id = 2,
-    };
-    try std.testing.expect(!shouldDebounceTextMessage(&ch, short_msg));
-
-    try ch.pending_text_messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user-a"),
-        .sender = try alloc.dupe(u8, "chat-a"),
-        .content = try alloc.dupe(u8, "pending"),
-        .channel = "telegram",
-        .timestamp = now,
-        .message_id = 0,
-    });
-    try ch.pending_text_received_at.append(alloc, now);
-
-    try std.testing.expect(shouldDebounceTextMessage(&ch, short_msg));
-}
-
-test "telegram shouldDebounceTextMessage does not debounce stale pending chain follow-up" {
-    const alloc = std.testing.allocator;
-    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
-    defer {
-        ch.resetPendingTextBuffers();
-        ch.pending_text_messages.deinit(alloc);
-        ch.pending_text_received_at.deinit(alloc);
-    }
-
-    const now = root.nowEpochSecs();
-    const short_msg: root.ChannelMessage = .{
-        .id = "user-a",
-        .sender = "chat-a",
-        .content = "oi",
-        .channel = "telegram",
-        .timestamp = now,
-        .message_id = 77,
-    };
-
-    try ch.pending_text_messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user-a"),
-        .sender = try alloc.dupe(u8, "chat-a"),
-        .content = try alloc.dupe(u8, "pending old"),
-        .channel = "telegram",
-        .timestamp = now - 60,
-        .message_id = 0,
-    });
-    try ch.pending_text_received_at.append(alloc, now - (TEXT_MESSAGE_DEBOUNCE_SECS + 5));
-
-    try std.testing.expect(!shouldDebounceTextMessage(&ch, short_msg));
-}
-
-test "telegram shouldDebounceTextMessage catches real-world ~3.4k split chunk" {
-    const alloc = std.testing.allocator;
-    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
-    defer {
-        ch.resetPendingTextBuffers();
-        ch.pending_text_messages.deinit(alloc);
-        ch.pending_text_received_at.deinit(alloc);
-    }
-
-    const now = root.nowEpochSecs();
-    const split_like_content = try alloc.alloc(u8, 3414);
-    defer alloc.free(split_like_content);
-    @memset(split_like_content, 'x');
-
-    const msg: root.ChannelMessage = .{
-        .id = "user-a",
-        .sender = "chat-a",
-        .content = split_like_content,
-        .channel = "telegram",
-        .timestamp = now,
-        .message_id = 100,
-    };
-
-    try std.testing.expect(shouldDebounceTextMessage(&ch, msg));
-}
-
-test "telegram textDebounceSecsForChain extends window for large chains" {
-    try std.testing.expectEqual(@as(u64, TEXT_MESSAGE_DEBOUNCE_SECS), textDebounceSecsForChain(1, 900));
-    try std.testing.expectEqual(@as(u64, LARGE_TEXT_CHAIN_DEBOUNCE_SECS), textDebounceSecsForChain(4, 900));
-    try std.testing.expectEqual(@as(u64, LARGE_TEXT_CHAIN_DEBOUNCE_SECS), textDebounceSecsForChain(2, LARGE_TEXT_CHAIN_MIN_BYTES));
-}
-
-test "telegram shouldDebounceTextMessage debounces medium chunk (~900 bytes)" {
-    const alloc = std.testing.allocator;
-    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
-    defer {
-        ch.resetPendingTextBuffers();
-        ch.pending_text_messages.deinit(alloc);
-        ch.pending_text_received_at.deinit(alloc);
-    }
-
-    const now = root.nowEpochSecs();
-    const medium_content = try alloc.alloc(u8, 900);
-    defer alloc.free(medium_content);
-    @memset(medium_content, 'x');
-
-    const msg: root.ChannelMessage = .{
-        .id = "user-b",
-        .sender = "chat-b",
-        .content = medium_content,
-        .channel = "telegram",
-        .timestamp = now,
-        .message_id = 101,
-    };
-
-    try std.testing.expect(shouldDebounceTextMessage(&ch, msg));
-}
-
-test "telegram mergeConsecutiveMessages merges non-consecutive ids for same sender/chat" {
-    const alloc = std.testing.allocator;
-    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
-    defer {
-        for (messages.items) |msg| {
-            var tmp = msg;
-            tmp.deinit(alloc);
-        }
-        messages.deinit(alloc);
-    }
-
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "First"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 10,
-    });
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "Second"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 15, // Gap in ids should still merge for rapid-fire coalescing
-    });
-
-    mergeConsecutiveMessages(alloc, &messages);
-
-    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
-    try std.testing.expectEqualStrings("First\nSecond", messages.items[0].content);
-}
-
-test "telegram mergeConsecutiveMessages allocation failure does not leak" {
-    const alloc = std.testing.allocator;
-    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
-    defer {
-        for (messages.items) |msg| {
-            var tmp = msg;
-            tmp.deinit(alloc);
-        }
-        messages.deinit(alloc);
-    }
-
-    const large_len = 32 * 1024;
-    const large_payload = try alloc.alloc(u8, large_len);
-    @memset(large_payload, 'x');
-
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = try alloc.dupe(u8, "A"),
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 1,
-    });
-    try messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user1"),
-        .sender = try alloc.dupe(u8, "chat1"),
-        .content = large_payload,
-        .channel = "telegram",
-        .timestamp = 0,
-        .message_id = 2,
-    });
-
-    var failing = std.testing.FailingAllocator.init(alloc, .{});
-    // First temp append succeeds; second temp allocation fails.
-    failing.fail_index = failing.alloc_index + 1;
-
-    mergeConsecutiveMessages(failing.allocator(), &messages);
-
-    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
-    try std.testing.expectEqualStrings("A", messages.items[0].content);
-    try std.testing.expectEqual(@as(usize, large_len), messages.items[1].content.len);
-    try std.testing.expectEqual(@as(u8, 'x'), messages.items[1].content[0]);
-}
-
 test "telegram mergeMediaGroups single item no merge" {
     const alloc = std.testing.allocator;
     var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
@@ -4182,55 +3682,11 @@ test "telegram flushMaturedPendingTextMessages waits for newest chain message" {
     try std.testing.expectEqual(@as(usize, 2), ch.pending_text_messages.items.len);
 
     // Force chain maturity by moving the newest timestamp back.
-    ch.pending_text_received_at.items[1] = now - (TEXT_MESSAGE_DEBOUNCE_SECS + 1);
+    ch.pending_text_received_at.items[1] = now - (telegram_ingress.TEXT_MESSAGE_DEBOUNCE_SECS + 1);
     ch.flushMaturedPendingTextMessages(alloc, &out_messages, &out_group_ids);
 
     try std.testing.expectEqual(@as(usize, 2), out_messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), ch.pending_text_messages.items.len);
-
-    ch.resetPendingTextBuffers();
-    ch.pending_text_messages.deinit(alloc);
-    ch.pending_text_received_at.deinit(alloc);
-}
-
-test "telegram cancelPendingTextChainForKey removes only matching sender/chat chain" {
-    const alloc = std.testing.allocator;
-    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
-
-    const now = root.nowEpochSecs();
-    try ch.pending_text_messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user-a"),
-        .sender = try alloc.dupe(u8, "chat-a"),
-        .content = try alloc.dupe(u8, "old-part-a1"),
-        .channel = "telegram",
-        .timestamp = now - 30,
-        .message_id = 1,
-    });
-    try ch.pending_text_received_at.append(alloc, now - 30);
-    try ch.pending_text_messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user-a"),
-        .sender = try alloc.dupe(u8, "chat-a"),
-        .content = try alloc.dupe(u8, "old-part-a2"),
-        .channel = "telegram",
-        .timestamp = now - 29,
-        .message_id = 2,
-    });
-    try ch.pending_text_received_at.append(alloc, now - 29);
-    try ch.pending_text_messages.append(alloc, .{
-        .id = try alloc.dupe(u8, "user-b"),
-        .sender = try alloc.dupe(u8, "chat-b"),
-        .content = try alloc.dupe(u8, "keep-me"),
-        .channel = "telegram",
-        .timestamp = now - 28,
-        .message_id = 3,
-    });
-    try ch.pending_text_received_at.append(alloc, now - 28);
-
-    ch.cancelPendingTextChainForKey("user-a", "chat-a");
-
-    try std.testing.expectEqual(@as(usize, 1), ch.pending_text_messages.items.len);
-    try std.testing.expectEqualStrings("user-b", ch.pending_text_messages.items[0].id);
-    try std.testing.expectEqualStrings("chat-b", ch.pending_text_messages.items[0].sender);
 
     ch.resetPendingTextBuffers();
     ch.pending_text_messages.deinit(alloc);
@@ -4297,40 +3753,6 @@ test "telegram nextPendingMediaDeadline returns earliest group deadline" {
     const deadline = nextPendingMediaDeadline(group_ids[0..], received_at[0..]);
     try std.testing.expect(deadline != null);
     try std.testing.expectEqual(@as(u64, 10), deadline.?); // group-b latest=7 => 7+3
-}
-
-test "telegram nextPendingTextDeadline returns earliest chain deadline" {
-    const messages = [_]root.ChannelMessage{
-        .{
-            .id = "user-a",
-            .sender = "chat-a",
-            .content = "a1",
-            .channel = "telegram",
-            .timestamp = 0,
-            .message_id = 1,
-        },
-        .{
-            .id = "user-b",
-            .sender = "chat-b",
-            .content = "b1",
-            .channel = "telegram",
-            .timestamp = 0,
-            .message_id = 100,
-        },
-        .{
-            .id = "user-a",
-            .sender = "chat-a",
-            .content = "a2",
-            .channel = "telegram",
-            .timestamp = 0,
-            .message_id = 2,
-        },
-    };
-    const received_at = [_]u64{ 10, 9, 12 };
-
-    const deadline = nextPendingTextDeadline(messages[0..], received_at[0..]);
-    try std.testing.expect(deadline != null);
-    try std.testing.expectEqual(@as(u64, 12), deadline.?); // chat-b latest=9 => 9+3
 }
 
 test "telegram sweepTempMediaFilesInDir removes only stale nullclaw temp media files" {

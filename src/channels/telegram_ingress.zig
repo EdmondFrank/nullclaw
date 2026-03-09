@@ -232,3 +232,324 @@ pub fn mergeConsecutiveMessages(
         extra.deinit(allocator);
     }
 }
+
+fn appendOwnedTestMessage(
+    allocator: std.mem.Allocator,
+    messages: *std.ArrayListUnmanaged(root.ChannelMessage),
+    id: []const u8,
+    sender: []const u8,
+    content: []const u8,
+    message_id: ?i64,
+) !void {
+    const id_dup = try allocator.dupe(u8, id);
+    errdefer allocator.free(id_dup);
+    const sender_dup = try allocator.dupe(u8, sender);
+    errdefer allocator.free(sender_dup);
+    const content_dup = try allocator.dupe(u8, content);
+    errdefer allocator.free(content_dup);
+
+    try messages.append(allocator, .{
+        .id = id_dup,
+        .sender = sender_dup,
+        .content = content_dup,
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = message_id,
+    });
+}
+
+fn deinitOwnedTestMessages(
+    allocator: std.mem.Allocator,
+    messages: *std.ArrayListUnmanaged(root.ChannelMessage),
+) void {
+    for (messages.items) |msg| {
+        var tmp = msg;
+        tmp.deinit(allocator);
+    }
+    messages.deinit(allocator);
+}
+
+fn testMessage(id: []const u8, sender: []const u8, content: []const u8, timestamp: u64, message_id: ?i64) root.ChannelMessage {
+    return .{
+        .id = id,
+        .sender = sender,
+        .content = content,
+        .channel = "telegram",
+        .timestamp = timestamp,
+        .message_id = message_id,
+    };
+}
+
+test "telegram ingress mergeConsecutiveMessages handles interleaved chats" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &messages);
+
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "Part 1", 10);
+    try appendOwnedTestMessage(alloc, &messages, "user2", "chat2", "Hello from chat 2", 50);
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "Part 2", 11);
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqualStrings("Part 1\nPart 2", messages.items[0].content);
+    try std.testing.expectEqual(@as(i64, 11), messages.items[0].message_id.?);
+    try std.testing.expectEqualStrings("Hello from chat 2", messages.items[1].content);
+}
+
+test "telegram ingress mergeConsecutiveMessages stops at interleaved sender in same chat" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &messages);
+
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "Part 1", 10);
+    try appendOwnedTestMessage(alloc, &messages, "user2", "chat1", "Interrupting reply", 11);
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "Part 2", 12);
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expectEqualStrings("Part 1", messages.items[0].content);
+    try std.testing.expectEqualStrings("Interrupting reply", messages.items[1].content);
+    try std.testing.expectEqualStrings("Part 2", messages.items[2].content);
+}
+
+test "telegram ingress mergeConsecutiveMessages skips commands" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &messages);
+
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "/help", 10);
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "some text", 11);
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqualStrings("/help", messages.items[0].content);
+    try std.testing.expectEqualStrings("some text", messages.items[1].content);
+}
+
+test "telegram ingress mergeConsecutiveMessages skips whitespace-padded commands" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &messages);
+
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", " \t/help", 10);
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "some text", 11);
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "\n/new", 12);
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expectEqualStrings(" \t/help", messages.items[0].content);
+    try std.testing.expectEqualStrings("some text", messages.items[1].content);
+    try std.testing.expectEqualStrings("\n/new", messages.items[2].content);
+}
+
+test "telegram ingress mergeConsecutiveMessages chain merges three parts" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &messages);
+
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "A", 1);
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "B", 2);
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "C", 3);
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqualStrings("A\nB\nC", messages.items[0].content);
+    try std.testing.expectEqual(@as(i64, 3), messages.items[0].message_id.?);
+}
+
+test "telegram ingress mergeConsecutiveMessages single message no-op" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &messages);
+
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "Hello", 42);
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqualStrings("Hello", messages.items[0].content);
+}
+
+test "telegram ingress shouldDebounceTextMessage handles long chunk and active chain" {
+    const alloc = std.testing.allocator;
+    var pending_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &pending_messages);
+    var received_at: std.ArrayListUnmanaged(u64) = .empty;
+    defer received_at.deinit(alloc);
+
+    const now = root.nowEpochSecs();
+    const long_content = try alloc.alloc(u8, TEXT_SPLIT_LIKELY_MIN_LEN);
+    defer alloc.free(long_content);
+    @memset(long_content, 'x');
+
+    const long_msg = testMessage("user-a", "chat-a", long_content, now, 1);
+    try std.testing.expect(shouldDebounceTextMessage(now, pending_messages.items, received_at.items, long_msg));
+
+    const short_msg = testMessage("user-a", "chat-a", "short", now, 2);
+    try std.testing.expect(!shouldDebounceTextMessage(now, pending_messages.items, received_at.items, short_msg));
+
+    try appendOwnedTestMessage(alloc, &pending_messages, "user-a", "chat-a", "pending", 0);
+    try received_at.append(alloc, now);
+
+    try std.testing.expect(shouldDebounceTextMessage(now, pending_messages.items, received_at.items, short_msg));
+}
+
+test "telegram ingress shouldDebounceTextMessage does not debounce stale pending chain follow-up" {
+    const alloc = std.testing.allocator;
+    var pending_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &pending_messages);
+    var received_at: std.ArrayListUnmanaged(u64) = .empty;
+    defer received_at.deinit(alloc);
+
+    const now = root.nowEpochSecs();
+    const short_msg = testMessage("user-a", "chat-a", "oi", now, 77);
+
+    try appendOwnedTestMessage(alloc, &pending_messages, "user-a", "chat-a", "pending old", 0);
+    try received_at.append(alloc, now - (TEXT_MESSAGE_DEBOUNCE_SECS + 5));
+
+    try std.testing.expect(!shouldDebounceTextMessage(now, pending_messages.items, received_at.items, short_msg));
+}
+
+test "telegram ingress shouldDebounceTextMessage catches real-world ~3.4k split chunk" {
+    const alloc = std.testing.allocator;
+    var pending_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &pending_messages);
+    var received_at: std.ArrayListUnmanaged(u64) = .empty;
+    defer received_at.deinit(alloc);
+
+    const now = root.nowEpochSecs();
+    const split_like_content = try alloc.alloc(u8, 3414);
+    defer alloc.free(split_like_content);
+    @memset(split_like_content, 'x');
+
+    const msg = testMessage("user-a", "chat-a", split_like_content, now, 100);
+    try std.testing.expect(shouldDebounceTextMessage(now, pending_messages.items, received_at.items, msg));
+}
+
+test "telegram ingress textDebounceSecsForChain extends window for large chains" {
+    try std.testing.expectEqual(@as(u64, TEXT_MESSAGE_DEBOUNCE_SECS), textDebounceSecsForChain(1, 900));
+    try std.testing.expectEqual(@as(u64, LARGE_TEXT_CHAIN_DEBOUNCE_SECS), textDebounceSecsForChain(4, 900));
+    try std.testing.expectEqual(@as(u64, LARGE_TEXT_CHAIN_DEBOUNCE_SECS), textDebounceSecsForChain(2, LARGE_TEXT_CHAIN_MIN_BYTES));
+}
+
+test "telegram ingress shouldDebounceTextMessage debounces medium chunk (~900 bytes)" {
+    const alloc = std.testing.allocator;
+    var pending_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &pending_messages);
+    var received_at: std.ArrayListUnmanaged(u64) = .empty;
+    defer received_at.deinit(alloc);
+
+    const now = root.nowEpochSecs();
+    const medium_content = try alloc.alloc(u8, 900);
+    defer alloc.free(medium_content);
+    @memset(medium_content, 'x');
+
+    const msg = testMessage("user-b", "chat-b", medium_content, now, 101);
+    try std.testing.expect(shouldDebounceTextMessage(now, pending_messages.items, received_at.items, msg));
+}
+
+test "telegram ingress mergeConsecutiveMessages merges non-consecutive ids for same sender/chat" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &messages);
+
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "First", 10);
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "Second", 15);
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqualStrings("First\nSecond", messages.items[0].content);
+}
+
+test "telegram ingress mergeConsecutiveMessages allocation failure does not leak" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &messages);
+
+    const large_len = 32 * 1024;
+    const large_payload = try alloc.alloc(u8, large_len);
+    @memset(large_payload, 'x');
+
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "A", 1);
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "chat1"),
+        .content = large_payload,
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = 2,
+    });
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    failing.fail_index = failing.alloc_index + 1;
+
+    mergeConsecutiveMessages(failing.allocator(), &messages);
+
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqualStrings("A", messages.items[0].content);
+    try std.testing.expectEqual(@as(usize, large_len), messages.items[1].content.len);
+    try std.testing.expectEqual(@as(u8, 'x'), messages.items[1].content[0]);
+}
+
+test "telegram ingress cancelPendingTextChainForKey removes only matching sender chat chain" {
+    const alloc = std.testing.allocator;
+    var pending_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &pending_messages);
+    var received_at: std.ArrayListUnmanaged(u64) = .empty;
+    defer received_at.deinit(alloc);
+
+    const now = root.nowEpochSecs();
+    try appendOwnedTestMessage(alloc, &pending_messages, "user-a", "chat-a", "old-part-a1", 1);
+    try received_at.append(alloc, now - 30);
+    try appendOwnedTestMessage(alloc, &pending_messages, "user-a", "chat-a", "old-part-a2", 2);
+    try received_at.append(alloc, now - 29);
+    try appendOwnedTestMessage(alloc, &pending_messages, "user-b", "chat-b", "keep-me", 3);
+    try received_at.append(alloc, now - 28);
+
+    cancelPendingTextChainForKey(alloc, &pending_messages, &received_at, "user-a", "chat-a");
+
+    try std.testing.expectEqual(@as(usize, 1), pending_messages.items.len);
+    try std.testing.expectEqualStrings("user-b", pending_messages.items[0].id);
+    try std.testing.expectEqualStrings("chat-b", pending_messages.items[0].sender);
+    try std.testing.expectEqual(@as(usize, 1), received_at.items.len);
+}
+
+test "telegram ingress nextPendingTextDeadline returns earliest chain deadline" {
+    const messages = [_]root.ChannelMessage{
+        .{
+            .id = "user-a",
+            .sender = "chat-a",
+            .content = "a1",
+            .channel = "telegram",
+            .timestamp = 0,
+            .message_id = 1,
+        },
+        .{
+            .id = "user-b",
+            .sender = "chat-b",
+            .content = "b1",
+            .channel = "telegram",
+            .timestamp = 0,
+            .message_id = 100,
+        },
+        .{
+            .id = "user-a",
+            .sender = "chat-a",
+            .content = "a2",
+            .channel = "telegram",
+            .timestamp = 0,
+            .message_id = 2,
+        },
+    };
+    const received_at = [_]u64{ 10, 9, 12 };
+
+    const deadline = nextPendingTextDeadline(messages[0..], received_at[0..]);
+    try std.testing.expect(deadline != null);
+    try std.testing.expectEqual(@as(u64, 12), deadline.?);
+}
