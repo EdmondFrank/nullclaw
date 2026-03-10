@@ -317,19 +317,23 @@ fn envExists(name: []const u8) bool {
     return true;
 }
 
-fn ensureAndroidBuildEnvironment() void {
-    const in_termux = envExists("TERMUX_VERSION");
-    const has_ndk =
+fn ensureAndroidBuildEnvironment(b: *std.Build) void {
+    if (envExists("TERMUX_VERSION")) return;
+    if (b.libc_file != null) return;
+
+    const has_android_sdk_or_ndk =
         envExists("ANDROID_NDK_HOME") or
         envExists("ANDROID_NDK_ROOT") or
         envExists("ANDROID_HOME") or
         envExists("ANDROID_SDK_ROOT");
 
-    if (in_termux or has_ndk) return;
-
-    std.log.err("Android / Termux builds need an Android libc/sysroot environment.", .{});
-    std.log.err("For native builds, run the build inside Termux.", .{});
-    std.log.err("For cross-builds, install the Android NDK and export ANDROID_NDK_HOME (or ANDROID_NDK_ROOT).", .{});
+    std.log.err("Android cross-builds need a Zig libc/sysroot file passed via --libc (or ZIG_LIBC).", .{});
+    if (has_android_sdk_or_ndk) {
+        std.log.err("An Android SDK/NDK environment was detected, but Zig still needs --libc pointing at the generated libc/sysroot file.", .{});
+    } else {
+        std.log.err("Install the Android NDK, generate a libc/sysroot file for the target, and pass it with --libc.", .{});
+    }
+    std.log.err("For native builds, run the build inside Termux without -Dtarget.", .{});
     std.log.err("If you are seeing a build.zig.zon parse error mentioning '.nullclaw', your Zig version is not 0.15.2.", .{});
     std.process.exit(1);
 }
@@ -395,7 +399,7 @@ pub fn build(b: *std.Build) void {
     const enable_channel_web = channels.enable_channel_web;
 
     if (target.result.abi == .android) {
-        ensureAndroidBuildEnvironment();
+        ensureAndroidBuildEnvironment(b);
     }
 
     const effective_enable_memory_sqlite = enable_sqlite and enable_memory_sqlite;
