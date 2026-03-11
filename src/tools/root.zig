@@ -287,6 +287,7 @@ pub fn allTools(
         hardware_boards: ?[]const []const u8 = null,
         mcp_tools: ?[]const Tool = null,
         agents: ?[]const @import("../config.zig").NamedAgentConfig = null,
+        configured_providers: []const @import("../config_types.zig").ProviderEntry = &.{},
         fallback_api_key: ?[]const u8 = null,
         delegate_depth: u32 = 0,
         subagent_manager: ?*@import("../subagent.zig").SubagentManager = null,
@@ -315,6 +316,7 @@ pub fn allTools(
         .timeout_ns = tc.shell_timeout_secs * std.time.ns_per_s,
         .max_output_bytes = tc.shell_max_output_bytes,
         .policy = opts.policy,
+        .path_env_vars = tc.path_env_vars,
     };
     try list.append(allocator, st.tool());
 
@@ -371,6 +373,7 @@ pub fn allTools(
     const dlt = try allocator.create(delegate.DelegateTool);
     dlt.* = .{
         .agents = opts.agents orelse &.{},
+        .configured_providers = opts.configured_providers,
         .fallback_api_key = opts.fallback_api_key,
         .depth = opts.delegate_depth,
     };
@@ -460,21 +463,7 @@ pub fn allTools(
         }
     }
 
-    const mgt = try allocator.create(message.MessageTool);
-    mgt.* = .{};
-    try list.append(allocator, mgt.tool());
-
     return list.toOwnedSlice(allocator);
-}
-
-/// Bind the event bus to message tools.
-pub fn bindEventBus(tools: []const Tool, event_bus: ?*@import("../bus.zig").Bus) void {
-    for (tools) |t| {
-        if (t.vtable == &message.MessageTool.vtable) {
-            const mt: *message.MessageTool = @ptrCast(@alignCast(t.ptr));
-            mt.event_bus = event_bus;
-        }
-    }
 }
 
 /// Bind a memory backend to memory tools in a pre-built tool list.
@@ -557,6 +546,7 @@ pub fn subagentTools(
         .timeout_ns = tc.shell_timeout_secs * std.time.ns_per_s,
         .max_output_bytes = tc.shell_max_output_bytes,
         .policy = opts.policy,
+        .path_env_vars = tc.path_env_vars,
     };
     try list.append(allocator, st.tool());
 
@@ -753,8 +743,8 @@ test "all tools includes extras when enabled" {
     // Order: shell, file_read, file_write, file_edit, git, image_info,
     //        memory_store, memory_recall, memory_list, memory_forget,
     //        delegate, schedule, spawn, pushover, http_request, web_search,
-    //        web_fetch, browser, message = 19
-    try std.testing.expectEqual(@as(usize, 19), tools.len);
+    //        web_fetch, browser = 18
+    try std.testing.expectEqual(@as(usize, 18), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -763,8 +753,8 @@ test "all tools excludes extras when disabled" {
 
     // Order: shell, file_read, file_write, file_edit, git, image_info,
     //        memory_store, memory_recall, memory_list, memory_forget,
-    //        delegate, schedule, spawn, message = 14
-    try std.testing.expectEqual(@as(usize, 14), tools.len);
+    //        delegate, schedule, spawn = 13
+    try std.testing.expectEqual(@as(usize, 13), tools.len);
 }
 
 test "all tools wires http and web_search config into tool instances" {
