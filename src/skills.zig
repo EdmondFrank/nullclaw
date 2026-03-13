@@ -1554,9 +1554,18 @@ fn installSkillDirectoryToWorkspace(
     source_path: []const u8,
     workspace_dir: []const u8,
     skill_name: []const u8,
+    skip_audit: bool,
 ) !void {
     try validateSkillName(skill_name);
-    try auditSkillDirectory(allocator, source_path);
+
+    // Perform security audit unless skipped
+    if (!skip_audit) {
+        try auditSkillDirectory(allocator, source_path);
+    } else {
+        auditSkillDirectory(allocator, source_path) catch |err| {
+            std.log.warn("Security audit failed for '{s}': {s} (continuing due to --force)", .{ skill_name, @errorName(err) });
+        };
+    }
 
     const skills_dir_path = try std.fmt.allocPrint(allocator, "{s}/skills", .{workspace_dir});
     defer allocator.free(skills_dir_path);
@@ -1581,12 +1590,19 @@ fn installSkillDirectoryToWorkspace(
         return err;
     };
 
-    auditSkillDirectory(allocator, target_path) catch |err| {
-        if (!target_existed) {
-            std.fs.deleteTreeAbsolute(target_path) catch {};
-        }
-        return err;
-    };
+    // Perform post-copy security audit unless skipped
+    if (!skip_audit) {
+        auditSkillDirectory(allocator, target_path) catch |err| {
+            if (!target_existed) {
+                std.fs.deleteTreeAbsolute(target_path) catch {};
+            }
+            return err;
+        };
+    } else {
+        auditSkillDirectory(allocator, target_path) catch |err| {
+            std.log.warn("Post-copy security audit failed for '{s}': {s} (continuing due to --force)", .{ skill_name, @errorName(err) });
+        };
+    }
 }
 
 fn deriveSkillNameFromSourcePath(allocator: std.mem.Allocator, source_path: []const u8) ![]u8 {
@@ -1602,6 +1618,7 @@ fn installSkillsFromRepositoryCollection(
     repo_root: []const u8,
     workspace_dir: []const u8,
     detail_out: ?*?[]u8,
+    skip_audit: bool,
 ) !usize {
     const collection_path = try std.fmt.allocPrint(allocator, "{s}/skills", .{repo_root});
     defer allocator.free(collection_path);
@@ -1623,7 +1640,7 @@ fn installSkillsFromRepositoryCollection(
 
         const skill_source_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ collection_path, entry.name });
         defer allocator.free(skill_source_path);
-        installSkillFromPath(allocator, skill_source_path, workspace_dir) catch |err| switch (err) {
+        installSkillFromPathWithOptions(allocator, skill_source_path, workspace_dir, skip_audit) catch |err| switch (err) {
             error.ManifestNotFound => continue,
             error.SkillAlreadyExists => {
                 failed_count += 1;
@@ -1660,6 +1677,7 @@ fn installSkillFromGit(
     source: []const u8,
     workspace_dir: []const u8,
     detail_out: ?*?[]u8,
+    skip_audit: bool,
 ) !void {
     const skills_dir_path = try std.fmt.allocPrint(allocator, "{s}/skills", .{workspace_dir});
     defer allocator.free(skills_dir_path);
@@ -1724,15 +1742,22 @@ fn installSkillFromGit(
 
     try removeGitMetadata(cloned_dir);
     if (try hasInstallableSkillContent(allocator, cloned_dir)) {
-        auditSkillDirectory(allocator, cloned_dir) catch |err| {
-            setInstallErrorDetail(allocator, detail_out, "skill security audit failed on cloned repository");
-            return err;
-        };
+        // Perform security audit on cloned directory unless skipped
+        if (!skip_audit) {
+            auditSkillDirectory(allocator, cloned_dir) catch |err| {
+                setInstallErrorDetail(allocator, detail_out, "skill security audit failed on cloned repository");
+                return err;
+            };
+        } else {
+            auditSkillDirectory(allocator, cloned_dir) catch |err| {
+                std.log.warn("Security audit failed on cloned repository: {s} (continuing due to --force)", .{@errorName(err)});
+            };
+        }
         cleanup_cloned_dir = false;
         return;
     }
 
-    const imported_count = installSkillsFromRepositoryCollection(allocator, cloned_dir, workspace_dir, detail_out) catch |err| {
+    const imported_count = installSkillsFromRepositoryCollection(allocator, cloned_dir, workspace_dir, detail_out, skip_audit) catch |err| {
         if (err == error.ManifestNotFound) {
             setInstallErrorDetail(
                 allocator,
@@ -1753,33 +1778,41 @@ fn installSkillFromGit(
 }
 
 /// Install a skill from either a local path or a git source URL, with optional error detail output.
+/// When skip_audit is true, security audit failures are logged but not blocking.
 pub fn installSkillWithDetail(
     allocator: std.mem.Allocator,
     source: []const u8,
     workspace_dir: []const u8,
     detail_out: ?*?[]u8,
+    skip_audit: bool,
 ) !void {
     clearInstallErrorDetail(allocator, detail_out);
     if (isGitSource(source)) {
-        return installSkillFromGit(allocator, source, workspace_dir, detail_out);
+        return installSkillFromGit(allocator, source, workspace_dir, detail_out, skip_audit);
     }
-    return installSkillFromPath(allocator, source, workspace_dir);
+    return installSkillFromPathWithOptions(allocator, source, workspace_dir, skip_audit);
 }
 
 /// Install a skill from either a local path or a git source URL.
 pub fn installSkill(allocator: std.mem.Allocator, source: []const u8, workspace_dir: []const u8) !void {
-    return installSkillWithDetail(allocator, source, workspace_dir, null);
+    return installSkillWithDetail(allocator, source, workspace_dir, null, false);
 }
 
 /// Install a skill by copying its directory into workspace_dir/skills/<source-dirname>/.
 /// Destination directory naming follows zeroclaw local install behavior.
 pub fn installSkillFromPath(allocator: std.mem.Allocator, source_path: []const u8, workspace_dir: []const u8) !void {
+    return installSkillFromPathWithOptions(allocator, source_path, workspace_dir, false);
+}
+
+/// Install a skill by copying its directory into workspace_dir/skills/<source-dirname>/.
+/// When skip_audit is true, security audit failures are logged but not blocking.
+pub fn installSkillFromPathWithOptions(allocator: std.mem.Allocator, source_path: []const u8, workspace_dir: []const u8, skip_audit: bool) !void {
     const source_abs = try resolveInstallableSkillSourceRoot(allocator, source_path);
     defer allocator.free(source_abs);
 
     const source_dir_name = try deriveSkillNameFromSourcePath(allocator, source_abs);
     defer allocator.free(source_dir_name);
-    return installSkillDirectoryToWorkspace(allocator, source_abs, workspace_dir, source_dir_name);
+    return installSkillDirectoryToWorkspace(allocator, source_abs, workspace_dir, source_dir_name, skip_audit);
 }
 
 /// Copy a file from src to dst. Supports both absolute and relative paths.
@@ -3339,7 +3372,7 @@ test "installSkillFromGit installs from local git repository" {
     try runCommand(allocator, &.{ "git", "-C", repo, "add", "skill.json", "SKILL.md" });
     try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
 
-    try installSkillFromGit(allocator, repo, workspace, null);
+    try installSkillFromGit(allocator, repo, workspace, null, false);
 
     const skills = try listSkills(allocator, workspace);
     defer freeSkills(allocator, skills);
@@ -3377,7 +3410,7 @@ test "installSkillFromGit supports root markdown-only repository" {
     try runCommand(allocator, &.{ "git", "-C", repo, "add", "SKILL.md" });
     try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
 
-    try installSkillFromGit(allocator, repo, workspace, null);
+    try installSkillFromGit(allocator, repo, workspace, null, false);
 
     const skills = try listSkills(allocator, workspace);
     defer freeSkills(allocator, skills);
@@ -3424,7 +3457,7 @@ test "installSkillFromGit installs all skills from repository skills directory" 
     try runCommand(allocator, &.{ "git", "-C", repo, "add", "skills/http_request/SKILL.md", "skills/review/SKILL.md", "README.md" });
     try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
 
-    try installSkillFromGit(allocator, repo, workspace, null);
+    try installSkillFromGit(allocator, repo, workspace, null, false);
 
     const skills = try listSkills(allocator, workspace);
     defer freeSkills(allocator, skills);
@@ -3481,7 +3514,7 @@ test "installSkillFromGit installs SKILL.toml entry from repository skills direc
     try runCommand(allocator, &.{ "git", "-C", repo, "add", "skills/toml_only/SKILL.toml" });
     try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
 
-    try installSkillFromGit(allocator, repo, workspace, null);
+    try installSkillFromGit(allocator, repo, workspace, null, false);
 
     const skills = try listSkills(allocator, workspace);
     defer freeSkills(allocator, skills);
@@ -3527,7 +3560,7 @@ test "installSkillFromGit keeps clone directory name when manifest name differs"
     try runCommand(allocator, &.{ "git", "-C", repo, "add", "skill.json", "SKILL.md", "assets/payload.txt" });
     try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
 
-    try installSkillFromGit(allocator, repo, workspace, null);
+    try installSkillFromGit(allocator, repo, workspace, null, false);
 
     const installed_skill_path = try std.fs.path.join(allocator, &.{ workspace, "skills", "repo" });
     defer allocator.free(installed_skill_path);
@@ -3584,7 +3617,7 @@ test "installSkillFromGit continues installing when one skill fails" {
     try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
 
     // Should succeed even though good_skill fails to install (already exists)
-    try installSkillFromGit(allocator, repo, workspace, null);
+    try installSkillFromGit(allocator, repo, workspace, null, false);
 
     // Only another_good should be installed (good_skill failed due to existing)
     const skills = try listSkills(allocator, workspace);
