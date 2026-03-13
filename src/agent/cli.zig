@@ -75,13 +75,17 @@ fn maybePrintAllProvidersFailedHint(
     );
 }
 
-fn providerFailureLooksRateLimited(detail: []const u8) bool {
-    return providers.reliable.isRateLimited(detail);
+fn providerFailureLooksQuotaConstrained(detail: []const u8) bool {
+    return providers.reliable.isRateLimited(detail) or
+        std.ascii.indexOfIgnoreCase(detail, "quota") != null or
+        std.ascii.indexOfIgnoreCase(detail, "credit") != null or
+        std.ascii.indexOfIgnoreCase(detail, "billing") != null or
+        std.ascii.indexOfIgnoreCase(detail, "out of credits") != null;
 }
 
 fn writeRateLimitHint(w: *std.Io.Writer, default_provider: []const u8) !void {
     try w.print(
-        "Hint: {s} appears rate-limited. Low-quota coding plans often reject tool-heavy agent loops even when plain chat still works.\n",
+        "Hint: {s} appears rate-limited or quota-constrained. Low-quota coding plans often reject tool-heavy agent loops even when plain chat still works.\n",
         .{default_provider},
     );
     try w.writeAll(
@@ -100,7 +104,7 @@ fn maybePrintRateLimitHint(
     const detail = providers.snapshotLastApiErrorDetail(allocator) catch null;
     if (detail) |msg| {
         defer allocator.free(msg);
-        if (!providerFailureLooksRateLimited(msg)) return;
+        if (!providerFailureLooksQuotaConstrained(msg)) return;
         try writeRateLimitHint(w, default_provider);
     }
 }
@@ -634,9 +638,11 @@ test "shouldPrintOpenAiCodexHint false when codex auth is missing" {
     try std.testing.expect(!shouldPrintOpenAiCodexHint("openai", false));
 }
 
-test "providerFailureLooksRateLimited detects rate limit detail" {
-    try std.testing.expect(providerFailureLooksRateLimited("compatible: status=429 message=Rate limit exceeded"));
-    try std.testing.expect(!providerFailureLooksRateLimited("compatible: status=401 message=Unauthorized"));
+test "providerFailureLooksQuotaConstrained detects rate and quota detail" {
+    try std.testing.expect(providerFailureLooksQuotaConstrained("compatible: status=429 message=Rate limit exceeded"));
+    try std.testing.expect(providerFailureLooksQuotaConstrained("groq: out of credits"));
+    try std.testing.expect(providerFailureLooksQuotaConstrained("openai: billing hard limit reached"));
+    try std.testing.expect(!providerFailureLooksQuotaConstrained("compatible: status=401 message=Unauthorized"));
 }
 
 test "writeRateLimitHint mentions reliability knobs and logs" {
@@ -646,5 +652,5 @@ test "writeRateLimitHint mentions reliability knobs and logs" {
     const rendered = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, rendered, "reliability.provider_backoff_ms") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "~/.nullclaw/logs/daemon.stdout.log") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "kimi appears rate-limited") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "kimi appears rate-limited or quota-constrained") != null);
 }
