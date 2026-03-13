@@ -730,7 +730,8 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\
             \\Commands:
             \\  list [--json]                 List installed skills
-            \\  install <source>              Install from GitHub URL or path
+            \\  install <source> [--force]    Install from GitHub URL or path
+            \\                                Use --force to skip security audit
             \\  remove <name>                 Remove a skill
             \\  info <name> [--json]          Show skill details
             \\
@@ -788,12 +789,13 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         }
     } else if (std.mem.eql(u8, subcmd, "install")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw skills install <source>\n", .{});
+            std.debug.print("Usage: nullclaw skills install <source> [--force]\n", .{});
             std.process.exit(1);
         }
+        const force = hasForceFlag(sub_args[2..]);
         var install_error_detail: ?[]u8 = null;
         defer if (install_error_detail) |msg| allocator.free(msg);
-        yc.skills.installSkillWithDetail(allocator, sub_args[1], cfg.workspace_dir, &install_error_detail) catch |err| {
+        yc.skills.installSkillWithDetail(allocator, sub_args[1], cfg.workspace_dir, &install_error_detail, force) catch |err| {
             if (install_error_detail) |msg| {
                 std.debug.print("{s}\n", .{msg});
             }
@@ -1041,6 +1043,13 @@ fn parseNonNegativeUsize(arg: []const u8) ?usize {
 fn hasJsonFlag(args: []const []const u8) bool {
     for (args) |a| {
         if (std.mem.eql(u8, a, "--json")) return true;
+    }
+    return false;
+}
+
+fn hasForceFlag(args: []const []const u8) bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--force") or std.mem.eql(u8, a, "-f")) return true;
     }
     return false;
 }
