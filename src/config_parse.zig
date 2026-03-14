@@ -2,6 +2,8 @@ const std = @import("std");
 const types = @import("config_types.zig");
 const agent_routing = @import("agent_routing.zig");
 
+const log = std.log.scoped(.config);
+
 // Forward-reference to the Config struct defined in config.zig.
 // Zig handles circular @import lazily, so this works as long as there is
 // no comptime-initialization cycle.
@@ -174,12 +176,18 @@ fn freeModelRouteConfig(allocator: std.mem.Allocator, route: types.ModelRouteCon
 
 /// Normalize a peer ID from config: convert legacy `#topic:N` format to
 /// canonical `:thread:N` format used internally for route matching.
+/// Logs a deprecation warning when conversion occurs.
 fn normalizePeerId(allocator: std.mem.Allocator, raw_id: []const u8) ![]u8 {
     const legacy_sep = "#topic:";
     if (std.mem.indexOf(u8, raw_id, legacy_sep)) |sep_pos| {
         const chat_id = raw_id[0..sep_pos];
         const thread_part = raw_id[sep_pos + legacy_sep.len ..];
         if (chat_id.len > 0 and thread_part.len > 0) {
+            log.warn(
+                "binding peer id \"{s}\" uses deprecated #topic: format — " ++
+                    "please update config.json to use \":thread:\" instead (e.g. \"{s}:thread:{s}\")",
+                .{ raw_id, chat_id, thread_part },
+            );
             return std.fmt.allocPrint(allocator, "{s}:thread:{s}", .{ chat_id, thread_part });
         }
     }
@@ -273,7 +281,7 @@ fn getPreferredAccount(channel_obj: std.json.ObjectMap) ?SelectedAccount {
     if (accounts.get("default")) |default_acc| {
         if (default_acc == .object) {
             if (has_multiple) {
-                std.log.warn("Multiple accounts configured; using accounts.default", .{});
+                log.warn("Multiple accounts configured; using accounts.default", .{});
             }
             return .{ .id = "default", .value = default_acc };
         }
@@ -281,7 +289,7 @@ fn getPreferredAccount(channel_obj: std.json.ObjectMap) ?SelectedAccount {
     if (accounts.get("main")) |main_acc| {
         if (main_acc == .object) {
             if (has_multiple) {
-                std.log.warn("Multiple accounts configured; using accounts.main", .{});
+                log.warn("Multiple accounts configured; using accounts.main", .{});
             }
             return .{ .id = "main", .value = main_acc };
         }
@@ -291,7 +299,7 @@ fn getPreferredAccount(channel_obj: std.json.ObjectMap) ?SelectedAccount {
     const first = it.next() orelse return null;
     if (first.value_ptr.* != .object) return null;
     if (has_multiple) {
-        std.log.warn("Multiple accounts configured; only first account used", .{});
+        log.warn("Multiple accounts configured; only first account used", .{});
     }
     return .{
         .id = first.key_ptr.*,
