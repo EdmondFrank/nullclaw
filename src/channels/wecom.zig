@@ -522,3 +522,11 @@ test "hasSecureCallbackConfig requires token and aes key" {
         .encoding_aes_key = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
     }));
 }
+
+test "wecom smoke basic channel contract" {
+    var ch = WeComChannel.init(std.testing.allocator, .{
+        .webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc",
+    });
+    try std.testing.expectEqualStrings("wecom", ch.channel().name());
+    try std.testing.expect(!ch.channel().healthCheck());
+}

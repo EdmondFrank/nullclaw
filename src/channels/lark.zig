@@ -2170,3 +2170,10 @@ test "lark parseEventPayload websocket payload with post message" {
     try std.testing.expect(std.mem.indexOf(u8, msgs[0].content, "Hello from websocket") != null);
     try std.testing.expect(std.mem.indexOf(u8, msgs[0].content, "WebSocket Post") != null);
 }
+
+test "lark smoke basic channel contract" {
+    var ch = LarkChannel.init(std.testing.allocator, "cli_x", "sec_y", "tok", 0, &.{"*"});
+
+    try std.testing.expectEqualStrings("lark", ch.channel().name());
+    try std.testing.expect(!ch.channel().healthCheck());
+}

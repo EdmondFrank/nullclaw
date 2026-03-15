@@ -2839,3 +2839,15 @@ test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE drops when group id missing"
 
     try std.testing.expectEqual(@as(usize, 0), event_bus_inst.inboundDepth());
 }
+
+test "qq smoke basic channel contract" {
+    var ch = QQChannel.init(std.testing.allocator, .{
+        .account_id = "qq-smoke",
+        .app_id = "app",
+        .app_secret = "secret",
+        .bot_token = "token",
+    });
+
+    try std.testing.expectEqualStrings("qq", ch.channel().name());
+    try std.testing.expect(ch.channel().healthCheck());
+}

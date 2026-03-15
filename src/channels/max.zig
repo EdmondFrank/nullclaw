@@ -2215,3 +2215,9 @@ test "parseCallbackPayload parses token and option index" {
 test {
     @import("std").testing.refAllDecls(@This());
 }
+
+test "max smoke basic channel contract" {
+    var ch = testChannel();
+    try std.testing.expectEqualStrings("max", ch.channel().name());
+    try std.testing.expect(ch.channel().healthCheck());
+}
