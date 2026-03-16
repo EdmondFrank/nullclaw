@@ -1327,6 +1327,7 @@ pub const SessionManager = struct {
             self.config.getProviderBaseUrl(profile.provider),
             self.config.getProviderNativeTools(profile.provider),
             self.config.getProviderUserAgent(profile.provider),
+            self.config.getProviderMaxStreamingPromptBytes(profile.provider),
         );
         return .{
             .provider = holder.provider(),
