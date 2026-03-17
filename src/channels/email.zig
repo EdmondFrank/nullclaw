@@ -49,7 +49,7 @@ pub const EmailChannel = struct {
 
         for (self.config.allow_from) |allowed| {
             if (std.mem.eql(u8, allowed, "*")) {
-                root.warnWildcardAllowAll();
+                root.warnWildcardAllowAll("email channel");
                 return true;
             }
 

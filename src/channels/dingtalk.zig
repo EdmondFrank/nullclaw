@@ -717,8 +717,8 @@ pub const DingTalkChannel = struct {
     }
 
     fn isSenderAllowed(self: *const DingTalkChannel, sender_id: []const u8, sender_staff_id: []const u8) bool {
-        return root.isAllowedExact(self.allow_from, sender_id) or
-            (sender_staff_id.len > 0 and root.isAllowedExact(self.allow_from, sender_staff_id));
+        return root.isAllowedExactScoped("dingtalk channel", self.allow_from, sender_id) or
+            (sender_staff_id.len > 0 and root.isAllowedExactScoped("dingtalk channel", self.allow_from, sender_staff_id));
     }
 
     pub fn healthCheck(self: *DingTalkChannel) bool {

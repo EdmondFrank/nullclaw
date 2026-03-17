@@ -766,7 +766,7 @@ pub const TelegramChannel = struct {
     pub fn isUserAllowed(self: *const TelegramChannel, sender: []const u8) bool {
         for (self.allow_from) |a| {
             if (std.mem.eql(u8, a, "*")) {
-                root.warnWildcardAllowAll();
+                root.warnWildcardAllowAll("telegram channel");
                 return true;
             }
             // Strip leading "@" from allowlist entry.
@@ -788,7 +788,7 @@ pub const TelegramChannel = struct {
     pub fn isGroupUserAllowed(self: *const TelegramChannel, sender: []const u8) bool {
         for (self.group_allow_from) |a| {
             if (std.mem.eql(u8, a, "*")) {
-                root.warnWildcardAllowAll();
+                root.warnWildcardAllowAll("telegram channel");
                 return true;
             }
             const trimmed = if (a.len > 1 and a[0] == '@') a[1..] else a;

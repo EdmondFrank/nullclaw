@@ -231,7 +231,7 @@ pub const MatrixChannel = struct {
 
         const effective = if (self.group_allow_from.len > 0) self.group_allow_from else self.allow_from;
         if (effective.len == 0) return false;
-        return root.isAllowed(effective, sender);
+        return root.isAllowedScoped("matrix channel", effective, sender);
     }
 
     fn collectDirectRooms(

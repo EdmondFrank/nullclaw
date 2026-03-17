@@ -72,7 +72,7 @@ pub const MaixCamChannel = struct {
         if (self.config.allow_from.len == 0) return true;
         for (self.config.allow_from) |allowed| {
             if (std.mem.eql(u8, allowed, "*")) {
-                root.warnWildcardAllowAll();
+                root.warnWildcardAllowAll("maixcam channel");
                 return true;
             }
             if (std.mem.eql(u8, allowed, device_id)) return true;

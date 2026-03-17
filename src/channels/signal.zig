@@ -267,7 +267,7 @@ pub const SignalChannel = struct {
         if (self.allow_from.len == 0) return false;
         for (self.allow_from) |entry| {
             if (std.mem.eql(u8, entry, "*")) {
-                root.warnWildcardAllowAll();
+                root.warnWildcardAllowAll("signal channel");
                 return true;
             }
             if (std.mem.eql(u8, normalizeAllowEntry(entry), normalizeAllowEntry(sender))) return true;
@@ -283,7 +283,7 @@ pub const SignalChannel = struct {
         if (self.group_allow_from.len == 0) return false;
         for (self.group_allow_from) |entry| {
             if (std.mem.eql(u8, entry, "*")) {
-                root.warnWildcardAllowAll();
+                root.warnWildcardAllowAll("signal channel");
                 return true;
             }
             if (std.mem.eql(u8, normalizeAllowEntry(entry), normalizeAllowEntry(sender))) return true;

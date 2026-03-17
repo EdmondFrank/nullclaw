@@ -816,7 +816,7 @@ fn allowEntryMatches(entry: []const u8, sender_id: []const u8, sender_name: ?[]c
     const normalized = normalizeAllowEntry(entry);
     if (normalized.len == 0) return false;
     if (std.mem.eql(u8, normalized, "*")) {
-        root.warnWildcardAllowAll();
+        root.warnWildcardAllowAll("mattermost channel");
         return true;
     }
     if (std.ascii.eqlIgnoreCase(normalized, normalizeAllowEntry(sender_id))) return true;
