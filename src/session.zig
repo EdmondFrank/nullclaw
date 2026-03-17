@@ -774,6 +774,7 @@ pub const SessionManager = struct {
 
     fn migrateScopedMemoryEntries(self: *SessionManager, canonical_session_key: []const u8, legacy_session_key: []const u8) void {
         const mem = self.mem orelse return;
+        if (std.mem.eql(u8, mem.name(), "markdown")) return;
 
         const legacy_entries = mem.list(self.allocator, null, legacy_session_key) catch return;
         defer memory_mod.freeEntries(self.allocator, legacy_entries);

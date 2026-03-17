@@ -1648,7 +1648,7 @@ pub const Agent = struct {
                     if (mem.store(key, effective_user_message, .conversation, self.memory_session_id)) |_| {
                         // Vector sync after auto-save
                         if (self.mem_rt) |rt| {
-                            rt.syncVectorAfterStore(self.allocator, key, effective_user_message);
+                            rt.syncVectorAfterStore(self.allocator, key, effective_user_message, self.memory_session_id);
                         }
                     } else |_| {}
                 }
@@ -2148,7 +2148,7 @@ pub const Agent = struct {
                             if (mem.store(key, summary, .conversation, self.memory_session_id)) |_| {
                                 // Vector sync after auto-save
                                 if (self.mem_rt) |rt| {
-                                    rt.syncVectorAfterStore(self.allocator, key, summary);
+                                    rt.syncVectorAfterStore(self.allocator, key, summary, self.memory_session_id);
                                 }
                             } else |_| {}
                         }
@@ -2618,9 +2618,8 @@ pub const Agent = struct {
                     } else {
                         const error_msg = result.error_msg orelse result.output;
                         const error_preview = if (error_msg.len > 256) error_msg[0..256] else error_msg;
-                        log.info("tool result: name={s} success={} error={s}", .{ call.name, result.success, error_preview});
+                        log.info("tool result: name={s} success={} error={s}", .{ call.name, result.success, error_preview });
                     }
-                    
                 }
                 return .{
                     .name = call.name,

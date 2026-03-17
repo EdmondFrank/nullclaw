@@ -1297,12 +1297,51 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.process.exit(1);
         }
         const key = sub_args[1];
+
+        var vector_delete_scopes: std.ArrayListUnmanaged(?[]u8) = .empty;
+        defer {
+            for (vector_delete_scopes.items) |sid_opt| {
+                if (sid_opt) |sid| allocator.free(sid);
+            }
+            vector_delete_scopes.deinit(allocator);
+        }
+
+        const existing_entries = mem_rt.memory.list(allocator, null, null) catch |err| {
+            std.debug.print("memory list failed before delete: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer yc.memory.freeEntries(allocator, existing_entries);
+
+        var saw_global = false;
+        for (existing_entries) |entry| {
+            if (!std.mem.eql(u8, entry.key, key)) continue;
+            if (entry.session_id) |sid| {
+                var seen = false;
+                for (vector_delete_scopes.items) |existing_sid| {
+                    if (existing_sid) |existing| {
+                        if (std.mem.eql(u8, existing, sid)) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                }
+                if (!seen) {
+                    try vector_delete_scopes.append(allocator, try allocator.dupe(u8, sid));
+                }
+            } else if (!saw_global) {
+                saw_global = true;
+                try vector_delete_scopes.append(allocator, null);
+            }
+        }
+
         const deleted = mem_rt.memory.forget(key) catch |err| {
             std.debug.print("memory forget failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
         if (deleted) {
-            mem_rt.deleteFromVectorStore(key);
+            for (vector_delete_scopes.items) |sid_opt| {
+                mem_rt.deleteFromVectorStore(key, sid_opt);
+            }
             std.debug.print("Deleted memory entry: {s}\n", .{key});
         } else {
             std.debug.print("Entry not deleted (missing or backend is append-only): {s}\n", .{key});

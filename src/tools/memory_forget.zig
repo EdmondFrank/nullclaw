@@ -49,7 +49,7 @@ pub const MemoryForgetTool = struct {
         if (forgotten) {
             // Best-effort vector store cleanup
             if (self.mem_rt) |rt| {
-                rt.deleteFromVectorStore(key);
+                rt.deleteFromVectorStore(key, session_id);
             }
             const msg = try std.fmt.allocPrint(allocator, "Forgot memory: {s}", .{key});
             return ToolResult{ .success = true, .output = msg };

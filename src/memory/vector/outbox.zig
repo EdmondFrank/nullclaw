@@ -14,6 +14,7 @@ const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.z
 const c = sqlite_mod.c;
 const SQLITE_STATIC = sqlite_mod.SQLITE_STATIC;
 const embeddings = @import("embeddings.zig");
+const key_codec = @import("key_codec.zig");
 const vector_store_mod = @import("store.zig");
 const circuit_breaker_mod = @import("circuit_breaker.zig");
 const log = std.log.scoped(.outbox);
@@ -267,13 +268,20 @@ pub const VectorOutbox = struct {
     /// Fetch content from the memories table by key. Returns null if not found.
     /// Caller owns the returned slice.
     fn fetchMemoryContent(self: *VectorOutbox, allocator: Allocator, key: []const u8) !?[]u8 {
-        const sql = "SELECT content FROM memories WHERE key = ?1";
+        const decoded = key_codec.decode(key);
+        const sql = if (decoded.session_id != null)
+            "SELECT content FROM memories WHERE key = ?1 AND session_id = ?2 LIMIT 1"
+        else
+            "SELECT content FROM memories WHERE key = ?1 AND session_id IS NULL LIMIT 1";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
 
-        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 1, decoded.logical_key.ptr, @intCast(decoded.logical_key.len), SQLITE_STATIC);
+        if (decoded.session_id) |sid| {
+            _ = c.sqlite3_bind_text(stmt, 2, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+        }
 
         rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_ROW) {
@@ -324,6 +332,24 @@ fn insertMemory(db: ?*c.sqlite3, key: []const u8, content: []const u8) !void {
 
     _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
     _ = c.sqlite3_bind_text(stmt, 2, content.ptr, @intCast(content.len), SQLITE_STATIC);
+
+    rc = c.sqlite3_step(stmt);
+    if (rc != c.SQLITE_DONE) return error.StepFailed;
+}
+
+fn insertScopedMemory(db: ?*c.sqlite3, key: []const u8, content: []const u8, session_id: []const u8) !void {
+    const sql =
+        "INSERT OR REPLACE INTO memories (id, key, content, category, session_id, created_at, updated_at) " ++
+        "VALUES (?1, ?2, ?3, 'core', ?4, datetime('now'), datetime('now'))";
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(db, sql, -1, &stmt, null);
+    if (rc != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+
+    _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_text(stmt, 2, key.ptr, @intCast(key.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_text(stmt, 3, content.ptr, @intCast(content.len), SQLITE_STATIC);
+    _ = c.sqlite3_bind_text(stmt, 4, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
 
     rc = c.sqlite3_step(stmt);
     if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -470,6 +496,26 @@ test "drain deletes item from outbox on success" {
 
     _ = try setup.ob.drain(allocator, ep, vs, null);
     try testing.expectEqual(@as(usize, 0), try totalOutboxCount(setup.mem.db));
+}
+
+test "drain resolves scoped content from encoded vector key" {
+    const allocator = testing.allocator;
+    var setup = try testSetup(allocator);
+    defer setup.deinit();
+
+    const encoded_key = try key_codec.encode(allocator, "scoped", "sess-a");
+    defer allocator.free(encoded_key);
+
+    try insertScopedMemory(setup.mem.db, "scoped", "scoped content", "sess-a");
+    try setup.ob.enqueue(encoded_key, "upsert");
+
+    var noop = embeddings.NoopEmbedding{};
+    const ep = noop.provider();
+    const vs = setup.vs_impl.store();
+
+    _ = try setup.ob.drain(allocator, ep, vs, null);
+    try testing.expectEqual(@as(usize, 0), try totalOutboxCount(setup.mem.db));
+    try testing.expectEqual(@as(usize, 1), try vs.count());
 }
 
 // 8. purgeDeadLetters removes over-limit items

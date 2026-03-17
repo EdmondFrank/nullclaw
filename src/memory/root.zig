@@ -50,6 +50,7 @@ pub const embeddings_ollama = @import("vector/embeddings_ollama.zig");
 pub const provider_router = @import("vector/provider_router.zig");
 pub const store_qdrant = @import("vector/store_qdrant.zig");
 pub const store_pgvector = @import("vector/store_pgvector.zig");
+pub const vector_key = @import("vector/key_codec.zig");
 pub const circuit_breaker = @import("vector/circuit_breaker.zig");
 pub const outbox = @import("vector/outbox.zig");
 pub const chunker = @import("vector/chunker.zig");
@@ -603,11 +604,18 @@ pub const MemoryRuntime = struct {
     /// Best-effort vector sync after a store() call.
     /// Embeds the content and upserts into the vector store.
     /// Errors are caught and logged, never propagated.
-    pub fn syncVectorAfterStore(self: *MemoryRuntime, allocator: std.mem.Allocator, key: []const u8, content: []const u8) void {
+    pub fn syncVectorAfterStore(
+        self: *MemoryRuntime,
+        allocator: std.mem.Allocator,
+        key: []const u8,
+        content: []const u8,
+        session_id: ?[]const u8,
+    ) void {
         syncVectorUpsertWithComponents(
             allocator,
             key,
             content,
+            session_id,
             self._outbox,
             self._embedding_provider,
             self._vector_store,
@@ -627,17 +635,20 @@ pub const MemoryRuntime = struct {
 
     /// Best-effort delete from vector store after a forget() call.
     /// Errors are caught and logged, never propagated.
-    pub fn deleteFromVectorStore(self: *MemoryRuntime, key: []const u8) void {
+    pub fn deleteFromVectorStore(self: *MemoryRuntime, key: []const u8, session_id: ?[]const u8) void {
+        const encoded_key = vector_key.encode(self._allocator, key, session_id) catch return;
+        defer self._allocator.free(encoded_key);
+
         if (self._outbox) |ob| {
-            ob.enqueue(key, "delete") catch |err| {
-                log.warn("outbox enqueue failed for key '{s}': {}", .{ key, err });
+            ob.enqueue(encoded_key, "delete") catch |err| {
+                log.warn("outbox enqueue failed for key '{s}': {}", .{ encoded_key, err });
             };
             return;
         }
 
         const vs = self._vector_store orelse return;
-        vs.delete(key) catch |err| {
-            log.warn("vector store delete failed for key '{s}': {}", .{ key, err });
+        vs.delete(encoded_key) catch |err| {
+            log.warn("vector store delete failed for key '{s}': {}", .{ encoded_key, err });
         };
     }
 
@@ -665,8 +676,14 @@ pub const MemoryRuntime = struct {
             defer allocator.free(emb);
             if (emb.len == 0) continue;
 
-            vs.upsert(entry.key, emb) catch |err| {
-                log.warn("reindex: upsert failed for key '{s}': {}", .{ entry.key, err });
+            const encoded_key = vector_key.encode(allocator, entry.key, entry.session_id) catch |err| {
+                log.warn("reindex: failed to encode vector key '{s}': {}", .{ entry.key, err });
+                continue;
+            };
+            defer allocator.free(encoded_key);
+
+            vs.upsert(encoded_key, emb) catch |err| {
+                log.warn("reindex: upsert failed for key '{s}': {}", .{ encoded_key, err });
                 continue;
             };
             reindexed += 1;
@@ -677,10 +694,12 @@ pub const MemoryRuntime = struct {
     }
 
     /// Enqueue a key for vector sync via the outbox (if configured).
-    pub fn enqueueVectorSync(self: *MemoryRuntime, key: []const u8, operation: []const u8) void {
+    pub fn enqueueVectorSync(self: *MemoryRuntime, key: []const u8, session_id: ?[]const u8, operation: []const u8) void {
         const ob = self._outbox orelse return;
-        ob.enqueue(key, operation) catch |err| {
-            log.warn("outbox enqueue failed for key '{s}': {}", .{ key, err });
+        const encoded_key = vector_key.encode(self._allocator, key, session_id) catch return;
+        defer self._allocator.free(encoded_key);
+        ob.enqueue(encoded_key, operation) catch |err| {
+            log.warn("outbox enqueue failed for key '{s}': {}", .{ encoded_key, err });
         };
     }
 
@@ -752,16 +771,20 @@ fn syncVectorUpsertWithComponents(
     allocator: std.mem.Allocator,
     key: []const u8,
     content: []const u8,
+    session_id: ?[]const u8,
     outbox_inst: ?*outbox.VectorOutbox,
     embed_provider: ?embeddings.EmbeddingProvider,
     vector_store_inst: ?vector_store.VectorStore,
     circuit_breaker_inst: ?*circuit_breaker.CircuitBreaker,
     log_prefix: []const u8,
 ) void {
+    const encoded_key = vector_key.encode(allocator, key, session_id) catch return;
+    defer allocator.free(encoded_key);
+
     // Durable mode: enqueue and return.
     if (outbox_inst) |ob| {
-        ob.enqueue(key, "upsert") catch |err| {
-            log.warn("{s}outbox enqueue failed for key '{s}': {}", .{ log_prefix, key, err });
+        ob.enqueue(encoded_key, "upsert") catch |err| {
+            log.warn("{s}outbox enqueue failed for key '{s}': {}", .{ log_prefix, encoded_key, err });
         };
         return;
     }
@@ -774,7 +797,7 @@ fn syncVectorUpsertWithComponents(
     }
 
     const emb = provider.embed(allocator, content) catch |err| {
-        log.warn("{s}vector sync embed failed for key '{s}': {}", .{ log_prefix, key, err });
+        log.warn("{s}vector sync embed failed for key '{s}': {}", .{ log_prefix, encoded_key, err });
         if (circuit_breaker_inst) |cb| cb.recordFailure();
         return;
     };
@@ -783,8 +806,8 @@ fn syncVectorUpsertWithComponents(
     if (circuit_breaker_inst) |cb| cb.recordSuccess();
     if (emb.len == 0) return;
 
-    vs.upsert(key, emb) catch |err| {
-        log.warn("{s}vector sync upsert failed for key '{s}': {}", .{ log_prefix, key, err });
+    vs.upsert(encoded_key, emb) catch |err| {
+        log.warn("{s}vector sync upsert failed for key '{s}': {}", .{ log_prefix, encoded_key, err });
     };
 }
 
@@ -799,6 +822,7 @@ fn syncPreservedChunkToVector(
         allocator,
         key,
         content,
+        null,
         ctx.outbox,
         ctx.embed_provider,
         ctx.vector_store,
@@ -1958,7 +1982,7 @@ test "syncVectorAfterStore enqueues when durable outbox is active" {
     const ob = rt._outbox orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 0), try ob.pendingCount());
 
-    rt.syncVectorAfterStore(std.testing.allocator, "k1", "content");
+    rt.syncVectorAfterStore(std.testing.allocator, "k1", "content", null);
     try std.testing.expectEqual(@as(usize, 1), try ob.pendingCount());
 }
 
@@ -1982,7 +2006,7 @@ test "deleteFromVectorStore enqueues delete when durable outbox is active" {
     const ob = rt._outbox orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 0), try ob.pendingCount());
 
-    rt.deleteFromVectorStore("k1");
+    rt.deleteFromVectorStore("k1", null);
     try std.testing.expectEqual(@as(usize, 1), try ob.pendingCount());
 }
 
@@ -2052,7 +2076,7 @@ test "MemoryRuntime.syncVectorAfterStore with no provider is no-op" {
         ._outbox = null,
     };
     // Should not crash — just a no-op
-    rt.syncVectorAfterStore(std.testing.allocator, "key", "content");
+    rt.syncVectorAfterStore(std.testing.allocator, "key", "content", null);
 }
 
 test "MemoryRuntime.drainOutbox with no outbox returns 0" {

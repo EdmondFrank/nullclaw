@@ -56,7 +56,7 @@ pub const MemoryStoreTool = struct {
 
         // Vector sync: embed and upsert into vector store (best-effort)
         if (self.mem_rt) |rt| {
-            rt.syncVectorAfterStore(allocator, key, content);
+            rt.syncVectorAfterStore(allocator, key, content, session_id);
         }
 
         const msg = try std.fmt.allocPrint(allocator, "Stored memory: {s} ({s})", .{ key, category.toString() });
