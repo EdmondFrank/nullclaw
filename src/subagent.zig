@@ -685,9 +685,9 @@ test "SubagentManager uses named agent workspace_path for task runner" {
 
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{base});
+    const config_path = try std.fs.path.join(std.testing.allocator, &.{ base, "config.json" });
     defer std.testing.allocator.free(config_path);
-    const expected_workspace = try std.fmt.allocPrint(std.testing.allocator, "{s}/agents/researcher", .{base});
+    const expected_workspace = try std.fs.path.join(std.testing.allocator, &.{ base, "agents", "researcher" });
     defer std.testing.allocator.free(expected_workspace);
 
     const agents = [_]config_mod.NamedAgentConfig{.{

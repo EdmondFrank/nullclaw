@@ -3436,9 +3436,9 @@ test "resolveAgentWorkspace resolves relative path against config directory" {
 
     const base = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
     defer allocator.free(config_path);
-    const expected_workspace = try std.fmt.allocPrint(allocator, "{s}/agents/coder", .{base});
+    const expected_workspace = try std.fs.path.join(allocator, &.{ base, "agents", "coder" });
     defer allocator.free(expected_workspace);
 
     const agents = [_]NamedAgentConfig{.{
