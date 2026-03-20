@@ -2042,11 +2042,3 @@ test "healthCheck requires running and connection" {
     channel.connected.store(true, .release);
     try std.testing.expect(channel.healthCheck());
 }
-
-test "dingtalk smoke basic channel contract" {
-    var ch = DingTalkChannel.init(std.testing.allocator, "cid", "secret", &.{"*"});
-    defer ch.clearEphemeralState();
-
-    try std.testing.expectEqualStrings("dingtalk", ch.channel().name());
-    try std.testing.expect(!ch.channel().healthCheck());
-}

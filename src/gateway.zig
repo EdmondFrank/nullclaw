@@ -2202,14 +2202,32 @@ fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.net.Stream) ![]u8 
     return readHttpRequestFromReader(allocator, stream);
 }
 
+const CONTENT_TYPE_JSON = "application/json";
+const CONTENT_TYPE_TEXT = "text/plain; charset=utf-8";
+const CONTENT_TYPE_XML = "application/xml; charset=utf-8";
+
+fn formatHttpResponseHeader(
+    buf: []u8,
+    status: []const u8,
+    content_type: []const u8,
+    body_len: usize,
+) ![]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{ status, content_type, body_len },
+    );
+}
+
+fn writeHttpResponse(stream: *std.net.Stream, status: []const u8, content_type: []const u8, body: []const u8) void {
+    var header_buf: [512]u8 = undefined;
+    const header = formatHttpResponseHeader(&header_buf, status, content_type, body.len) catch return;
+    _ = stream.write(header) catch return;
+    if (body.len > 0) _ = stream.write(body) catch {};
+}
+
 fn writeJsonResponse(stream: *std.net.Stream, status: []const u8, body: []const u8) void {
-    var resp_buf: [2048]u8 = undefined;
-    const resp = std.fmt.bufPrint(
-        &resp_buf,
-        "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
-        .{ status, body.len, body },
-    ) catch return;
-    _ = stream.write(resp) catch {};
+    writeHttpResponse(stream, status, CONTENT_TYPE_JSON, body);
 }
 
 /// Process an incoming message by spawning `nullclaw agent -m "..."`.
@@ -2331,8 +2349,19 @@ const WebhookHandlerContext = struct {
     state: *GatewayState,
     session_mgr_opt: ?*session_mod.SessionManager,
     response_status: []const u8 = "200 OK",
+    response_content_type: []const u8 = CONTENT_TYPE_JSON,
     response_body: []const u8 = "",
 };
+
+fn setPlainTextResponse(ctx: *WebhookHandlerContext, body: []const u8) void {
+    ctx.response_content_type = CONTENT_TYPE_TEXT;
+    ctx.response_body = body;
+}
+
+fn setXmlResponse(ctx: *WebhookHandlerContext, body: []const u8) void {
+    ctx.response_content_type = CONTENT_TYPE_XML;
+    ctx.response_body = body;
+}
 
 const WebhookHandlerFn = *const fn (ctx: *WebhookHandlerContext) void;
 
@@ -3303,6 +3332,11 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
         secure_aes_key = wechat_cfg.encoding_aes_key orelse "";
         expected_app_id = wechat_cfg.app_id orelse "";
     }
+    if (callback_token.len == 0) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"wechat callback not configured\"}";
+        return;
+    }
 
     const secure_enabled = callback_token.len > 0 and secure_aes_key.len > 0;
 
@@ -3347,7 +3381,7 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
                     ctx.response_body = "{\"error\":\"decrypt failed\"}";
                     return;
                 };
-                ctx.response_body = plain_echo;
+                setPlainTextResponse(ctx, plain_echo);
                 return;
             } else {
                 const signature = parseQueryParam(ctx.target, "signature") orelse {
@@ -3363,7 +3397,7 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
             }
         }
 
-        ctx.response_body = echo;
+        setPlainTextResponse(ctx, echo);
         return;
     }
 
@@ -3380,7 +3414,7 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
     }
 
     const body = extractBody(ctx.raw_request) orelse {
-        ctx.response_body = "success";
+        setPlainTextResponse(ctx, "success");
         return;
     };
 
@@ -3456,16 +3490,16 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
     defer ctx.req_allocator.free(inbound_payload);
 
     var inbound = channels.wechat.parseIncomingPayload(ctx.req_allocator, inbound_payload) catch {
-        ctx.response_body = "success";
+        setPlainTextResponse(ctx, "success");
         return;
     } orelse {
-        ctx.response_body = "success";
+        setPlainTextResponse(ctx, "success");
         return;
     };
     defer inbound.deinit(ctx.req_allocator);
 
     if (wechat_allow_from.len > 0 and !channels.isAllowed(wechat_allow_from, inbound.from_user)) {
-        ctx.response_body = "success";
+        setPlainTextResponse(ctx, "success");
         return;
     }
 
@@ -3484,7 +3518,7 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
             inbound.from_user,
         }) catch null;
         _ = publishToBus(eb, ctx.state.allocator, "wechat", inbound.from_user, inbound.from_user, inbound.content, session_key, meta);
-        ctx.response_body = "success";
+        setPlainTextResponse(ctx, "success");
         return;
     }
 
@@ -3508,15 +3542,15 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
                 r,
                 now_secs,
             ) catch {
-                ctx.response_body = "success";
+                setPlainTextResponse(ctx, "success");
                 return;
             };
-            ctx.response_body = xml;
+            setXmlResponse(ctx, xml);
             return;
         }
     }
 
-    ctx.response_body = "success";
+    setPlainTextResponse(ctx, "success");
 }
 
 fn handleWeComWebhookRoute(ctx: *WebhookHandlerContext) void {
@@ -3542,47 +3576,48 @@ fn handleWeComWebhookRoute(ctx: *WebhookHandlerContext) void {
     }
 
     const secure_enabled = secure_token.len > 0 and secure_aes_key.len > 0;
+    if (!secure_enabled) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"wecom secure callback not configured\"}";
+        return;
+    }
 
     if (std.mem.eql(u8, ctx.method, "GET")) {
         if (parseQueryParam(ctx.target, "echostr")) |echo_str| {
-            if (secure_enabled) {
-                const msg_sig = parseQueryParam(ctx.target, "msg_signature") orelse {
-                    ctx.response_status = "400 Bad Request";
-                    ctx.response_body = "{\"error\":\"missing msg_signature\"}";
-                    return;
-                };
-                const timestamp = parseQueryParam(ctx.target, "timestamp") orelse {
-                    ctx.response_status = "400 Bad Request";
-                    ctx.response_body = "{\"error\":\"missing timestamp\"}";
-                    return;
-                };
-                const nonce = parseQueryParam(ctx.target, "nonce") orelse {
-                    ctx.response_status = "400 Bad Request";
-                    ctx.response_body = "{\"error\":\"missing nonce\"}";
-                    return;
-                };
+            const msg_sig = parseQueryParam(ctx.target, "msg_signature") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing msg_signature\"}";
+                return;
+            };
+            const timestamp = parseQueryParam(ctx.target, "timestamp") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing timestamp\"}";
+                return;
+            };
+            const nonce = parseQueryParam(ctx.target, "nonce") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing nonce\"}";
+                return;
+            };
 
-                if (!channels.wecom.verifySignature(secure_token, timestamp, nonce, echo_str, msg_sig)) {
-                    ctx.response_status = "403 Forbidden";
-                    ctx.response_body = "{\"error\":\"invalid signature\"}";
-                    return;
-                }
-
-                const expected_receive_id: ?[]const u8 = if (secure_corp_id.len > 0) secure_corp_id else null;
-                const plain_echo = channels.wecom.decryptSecurePayload(
-                    ctx.req_allocator,
-                    secure_aes_key,
-                    echo_str,
-                    expected_receive_id,
-                ) catch {
-                    ctx.response_status = "403 Forbidden";
-                    ctx.response_body = "{\"error\":\"decrypt failed\"}";
-                    return;
-                };
-                ctx.response_body = plain_echo;
-            } else {
-                ctx.response_body = echo_str;
+            if (!channels.wecom.verifySignature(secure_token, timestamp, nonce, echo_str, msg_sig)) {
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"invalid signature\"}";
+                return;
             }
+
+            const expected_receive_id: ?[]const u8 = if (secure_corp_id.len > 0) secure_corp_id else null;
+            const plain_echo = channels.wecom.decryptSecurePayload(
+                ctx.req_allocator,
+                secure_aes_key,
+                echo_str,
+                expected_receive_id,
+            ) catch {
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"decrypt failed\"}";
+                return;
+            };
+            setPlainTextResponse(ctx, plain_echo);
         } else {
             ctx.response_body = "{\"status\":\"ok\"}";
         }
@@ -3605,7 +3640,7 @@ fn handleWeComWebhookRoute(ctx: *WebhookHandlerContext) void {
         return;
     };
 
-    const inbound_payload = if (secure_enabled) blk: {
+    const inbound_payload = blk: {
         const encrypted = channels.wecom.extractEncryptedField(body) orelse {
             ctx.response_status = "400 Bad Request";
             ctx.response_body = "{\"error\":\"missing Encrypt field\"}";
@@ -3644,10 +3679,6 @@ fn handleWeComWebhookRoute(ctx: *WebhookHandlerContext) void {
             ctx.response_body = "{\"error\":\"decrypt failed\"}";
             return;
         };
-    } else ctx.req_allocator.dupe(u8, body) catch {
-        ctx.response_status = "500 Internal Server Error";
-        ctx.response_body = "{\"error\":\"out of memory\"}";
-        return;
     };
     defer ctx.req_allocator.free(inbound_payload);
 
@@ -4579,6 +4610,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
         const is_post = std.mem.eql(u8, method_str, "POST");
         var response_status: []const u8 = "200 OK";
+        var response_content_type: []const u8 = CONTENT_TYPE_JSON;
         var response_body: []const u8 = "";
         var pair_response_buf: [256]u8 = undefined;
 
@@ -4595,6 +4627,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             };
             desc.handler(&webhook_ctx);
             response_status = webhook_ctx.response_status;
+            response_content_type = webhook_ctx.response_content_type;
             response_body = webhook_ctx.response_body;
         } else if (hasSlackHttpEndpoint(config_opt, base_path)) {
             var webhook_ctx = WebhookHandlerContext{
@@ -4609,6 +4642,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             };
             handleSlackWebhookRoute(&webhook_ctx);
             response_status = webhook_ctx.response_status;
+            response_content_type = webhook_ctx.response_content_type;
             response_body = webhook_ctx.response_body;
         } else if (std.mem.eql(u8, base_path, "/.well-known/agent.json") or
             std.mem.eql(u8, base_path, "/.well-known/agent-card.json"))
@@ -4810,7 +4844,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
         // Send HTTP response (skip if SSE streaming already wrote directly).
         if (response_status.len > 0) {
-            writeJsonResponse(&conn.stream, response_status, response_body);
+            writeHttpResponse(&conn.stream, response_status, response_content_type, response_body);
         }
     }
 }
@@ -5655,6 +5689,84 @@ test "selectWeChatConfig picks account by query account_id" {
     try std.testing.expectEqualStrings("backup", selected.?.account_id);
 }
 
+test "formatHttpResponseHeader uses provided content type" {
+    var buf: [256]u8 = undefined;
+    const header = try formatHttpResponseHeader(&buf, "202 Accepted", CONTENT_TYPE_XML, 11);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, header, 1, "HTTP/1.1 202 Accepted\r\n"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, header, 1, "Content-Type: application/xml; charset=utf-8\r\n"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, header, 1, "Content-Length: 11\r\n"));
+}
+
+test "handleWeChatWebhookRoute requires callback token configuration" {
+    if (!build_options.enable_channel_wechat) return;
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw_request =
+        "POST /wechat HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/xml\r\n\r\n" ++
+        "<xml></xml>";
+    var ctx = WebhookHandlerContext{
+        .root_allocator = std.testing.allocator,
+        .req_allocator = std.testing.allocator,
+        .raw_request = raw_request,
+        .method = "POST",
+        .target = "/wechat",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleWeChatWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("404 Not Found", ctx.response_status);
+    try std.testing.expectEqualStrings(CONTENT_TYPE_JSON, ctx.response_content_type);
+    try std.testing.expectEqualStrings("{\"error\":\"wechat callback not configured\"}", ctx.response_body);
+}
+
+test "handleWeComWebhookRoute requires secure callback configuration" {
+    if (!build_options.enable_channel_wecom) return;
+
+    const wecom_accounts = [_]config_types.WeComConfig{
+        .{
+            .account_id = "main",
+            .webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=main",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{ .wecom = &wecom_accounts },
+    };
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw_request =
+        "POST /wecom HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/xml\r\n\r\n" ++
+        "<xml></xml>";
+    var ctx = WebhookHandlerContext{
+        .root_allocator = std.testing.allocator,
+        .req_allocator = std.testing.allocator,
+        .raw_request = raw_request,
+        .method = "POST",
+        .target = "/wecom",
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleWeComWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("404 Not Found", ctx.response_status);
+    try std.testing.expectEqualStrings(CONTENT_TYPE_JSON, ctx.response_content_type);
+    try std.testing.expectEqualStrings("{\"error\":\"wecom secure callback not configured\"}", ctx.response_body);
+}
+
 test "selectQqConfig picks account by X-Bot-Appid header" {
     const qq_accounts = [_]config_types.QQConfig{
         .{
@@ -5930,6 +6042,7 @@ test "handleWeChatWebhookRoute accepts secure encrypted callback" {
 
     handleWeChatWebhookRoute(&ctx);
     try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    try std.testing.expectEqualStrings(CONTENT_TYPE_TEXT, ctx.response_content_type);
     try std.testing.expectEqualStrings("success", ctx.response_body);
 }
 

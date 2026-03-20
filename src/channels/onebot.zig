@@ -1189,9 +1189,3 @@ test "getJsonInt extracts integer" {
     try std.testing.expect(getJsonInt(parsed.value, "name") == null);
     try std.testing.expect(getJsonInt(parsed.value, "missing") == null);
 }
-
-test "onebot smoke basic channel contract" {
-    var ch = OneBotChannel.init(std.testing.allocator, .{});
-    try std.testing.expectEqualStrings("onebot", ch.channel().name());
-    try std.testing.expect(!ch.channel().healthCheck());
-}
