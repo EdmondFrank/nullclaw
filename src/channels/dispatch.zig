@@ -348,7 +348,6 @@ fn dispatchDraftFinal(
 fn dispatchOutboundDirect(channel: root.Channel, msg: bus.OutboundMessage) !void {
     if (msg.stage == .final and
         msg.media.len == 0 and
-        msg.choices.len > 0 and
         !outbound.has_legacy_attachment_markers(msg.content))
     {
         channel.sendRich(msg.chat_id, .{
