@@ -545,6 +545,36 @@ pub const WeChatConfig = struct {
     allow_from: []const []const u8 = &.{},
 };
 
+pub const WeChatIlinkConfig = struct {
+    account_id: []const u8 = "default",
+    /// QR login timeout in milliseconds (default: 480000 = 8 minutes).
+    timeout_ms: ?u32 = null,
+    /// Bot type parameter (default: "3").
+    bot_type: ?[]const u8 = null,
+    /// Max QR refreshes on expiry (default: 3).
+    max_refreshes: ?u32 = null,
+    /// WeChat iLink API base URL (default: "https://ilinkai.weixin.qq.com").
+    base_url: ?[]const u8 = null,
+    /// Pre-saved token for session resume (optional).
+    token: ?[]const u8 = null,
+    /// Allowed sender IDs (empty = allow all, "*" = wildcard).
+    allow_from: []const []const u8 = &.{},
+    /// JavaScript runtime to use ("node" or "bun"). Default: "node".
+    /// Ignored if `command` is specified.
+    runtime: []const u8 = "node",
+    /// Custom command to execute (optional).
+    /// If specified, this overrides `runtime` and is executed directly.
+    /// Example: "/path/to/custom-script.sh" or "deno"
+    command: ?[]const u8 = null,
+    /// Custom arguments for the command (optional).
+    /// If not specified with `command`, defaults are used.
+    args: ?[]const []const u8 = null,
+    /// Control request timeout in milliseconds (default: 10000 = 10s).
+    /// This affects get_manifest and start request timeouts.
+    /// Increase if the plugin needs more time to initialize.
+    control_timeout_ms: ?u32 = null,
+};
+
 pub const WeComConfig = struct {
     account_id: []const u8 = "default",
     webhook_url: []const u8,
@@ -895,6 +925,7 @@ pub const ChannelsConfig = struct {
     lark: []const LarkConfig = &.{},
     dingtalk: []const DingTalkConfig = &.{},
     wechat: []const WeChatConfig = &.{},
+    wechat_ilink: []const WeChatIlinkConfig = &.{},
     wecom: []const WeComConfig = &.{},
     signal: []const SignalConfig = &.{},
     email: []const EmailConfig = &.{},
@@ -960,6 +991,9 @@ pub const ChannelsConfig = struct {
     }
     pub fn wechatPrimary(self: *const ChannelsConfig) ?WeChatConfig {
         return primaryAccount(WeChatConfig, self.wechat);
+    }
+    pub fn wechatIlinkPrimary(self: *const ChannelsConfig) ?WeChatIlinkConfig {
+        return primaryAccount(WeChatIlinkConfig, self.wechat_ilink);
     }
     pub fn wecomPrimary(self: *const ChannelsConfig) ?WeComConfig {
         return primaryAccount(WeComConfig, self.wecom);

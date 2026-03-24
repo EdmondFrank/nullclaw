@@ -321,7 +321,9 @@ pub const ExternalChannel = struct {
     }
 
     fn controlRequestTimeoutMs(self: *const Self) u32 {
-        return @min(self.config.transport.timeout_ms, CONTROL_REQUEST_TIMEOUT_MS);
+        // Use the configured transport timeout if it's higher than the default,
+        // otherwise use the default control timeout
+        return @max(self.config.transport.timeout_ms, CONTROL_REQUEST_TIMEOUT_MS);
     }
 
     fn sendRequestTimeoutMs(self: *const Self) u32 {

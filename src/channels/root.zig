@@ -285,6 +285,7 @@ pub const email = @import("email.zig");
 pub const lark = @import("lark.zig");
 pub const dingtalk = @import("dingtalk.zig");
 pub const wechat = @import("wechat.zig");
+pub const wechat_ilink = @import("wechat_ilink.zig");
 pub const wecom = @import("wecom.zig");
 pub const nostr = @import("nostr.zig");
 pub const line = @import("line.zig");

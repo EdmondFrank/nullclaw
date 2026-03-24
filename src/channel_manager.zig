@@ -801,6 +801,9 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
     const maixcam_accounts = [_]@import("config_types.zig").MaixCamConfig{
         .{ .account_id = "cam-main", .name = "maixcam-main" },
     };
+    const wechat_ilink_accounts = [_]@import("config_types.zig").WeChatIlinkConfig{
+        .{ .account_id = "wechat-ilink-main", .allow_from = &.{"*"} },
+    };
     const external_accounts = [_]@import("config_types.zig").ExternalChannelConfig{
         .{
             .account_id = "ext-main",
@@ -838,6 +841,7 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
             .mattermost = &mattermost_accounts,
             .slack = &slack_accounts,
             .maixcam = &maixcam_accounts,
+            .wechat_ilink = &wechat_ilink_accounts,
             .external = &external_accounts,
             .max = &max_accounts,
             .whatsapp = &[_]@import("config_types.zig").WhatsAppConfig{
