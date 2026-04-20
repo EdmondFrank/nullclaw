@@ -2564,7 +2564,7 @@ fn installSkillFromWellKnownUrl(
     defer file.close();
     try file.writeAll(fetched_body.?);
 
-    installSkillDirectoryToWorkspace(allocator, temp_dir, workspace_dir, skill_dir_name) catch |err| {
+    installSkillDirectoryToWorkspace(allocator, temp_dir, workspace_dir, skill_dir_name, false) catch |err| {
         if (err == error.SkillAlreadyExists) {
             const msg = try std.fmt.allocPrint(allocator, "skill '{s}' already exists", .{skill_dir_name});
             defer allocator.free(msg);
@@ -3952,7 +3952,7 @@ test "installSkillWithDetail rejects insecure http source before any network I/O
 
     try std.testing.expectError(
         error.SkillSecurityAuditFailed,
-        installSkillWithDetail(std.testing.allocator, "http://example.com/skill.md", workspace_dir, null),
+        installSkillWithDetail(std.testing.allocator, "http://example.com/skill.md", workspace_dir, null, false),
     );
 }
 
@@ -5074,7 +5074,7 @@ test "installSkillFromGit returns SkillAlreadyExists when repository collection 
     var install_error_detail: ?[]u8 = null;
     defer if (install_error_detail) |msg| allocator.free(msg);
 
-    try std.testing.expectError(error.SkillAlreadyExists, installSkillFromGit(allocator, repo, workspace, &install_error_detail));
+    try std.testing.expectError(error.SkillAlreadyExists, installSkillFromGit(allocator, repo, workspace, &install_error_detail, false));
     try std.testing.expect(install_error_detail != null);
     try std.testing.expect(std.mem.indexOf(u8, install_error_detail.?, "existing_skill") != null);
 }
@@ -5109,7 +5109,7 @@ test "installSkillFromGit preserves repository collection security failures" {
     var install_error_detail: ?[]u8 = null;
     defer if (install_error_detail) |msg| allocator.free(msg);
 
-    try std.testing.expectError(error.SkillSecurityAuditFailed, installSkillFromGit(allocator, repo, workspace, &install_error_detail));
+    try std.testing.expectError(error.SkillSecurityAuditFailed, installSkillFromGit(allocator, repo, workspace, &install_error_detail, false));
     try std.testing.expect(install_error_detail != null);
     try std.testing.expect(std.mem.indexOf(u8, install_error_detail.?, "unsafe") != null);
 }

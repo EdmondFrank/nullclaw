@@ -41,7 +41,8 @@ pub const WeChatIlinkChannel = struct {
         var plugin_config_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer plugin_config_buf.deinit(allocator);
 
-        const writer = plugin_config_buf.writer(allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &plugin_config_buf);
+        const writer = &buf_writer.writer;
 
         try writer.writeAll("{");
 

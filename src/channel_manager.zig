@@ -1019,6 +1019,10 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
         expected_total += config.channels.dingtalk.len;
         expected_gateway_loop += config.channels.dingtalk.len;
     }
+    if (channel_catalog.isBuildEnabled(.wechat_ilink)) {
+        expected_total += config.channels.wechat_ilink.len;
+        expected_gateway_loop += config.channels.wechat_ilink.len;
+    }
 
     try std.testing.expectEqual(expected_total, mgr.count());
     try std.testing.expectEqual(expected_total, reg.count());
