@@ -27,3 +27,4 @@ config.signal.json
 .trae/
 .codebuddy/
 .cecli*
+.aider*
