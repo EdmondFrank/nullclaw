@@ -1275,6 +1275,7 @@ fn installDownloadedWebSkillArtifact(
     skill_name: []const u8,
     workspace_dir: []const u8,
     detail_out: ?*?[]u8,
+    skip_audit: bool,
 ) !void {
     const tmp_root = try platform.getTempDir(allocator);
     defer allocator.free(tmp_root);
@@ -1326,7 +1327,7 @@ fn installDownloadedWebSkillArtifact(
         std_compat.fs.deleteFileAbsolute(archive_path) catch {};
     }
 
-    installSkillDirectoryToWorkspace(allocator, temp_dir, workspace_dir, skill_name) catch |err| {
+    installSkillDirectoryToWorkspace(allocator, temp_dir, workspace_dir, skill_name, skip_audit) catch |err| {
         if (err == error.SkillAlreadyExists) {
             const msg = try std.fmt.allocPrint(allocator, "skill '{s}' already exists", .{skill_name});
             defer allocator.free(msg);
@@ -1357,6 +1358,7 @@ fn installSkillsFromWellKnownIndex(
     source: []const u8,
     workspace_dir: []const u8,
     detail_out: ?*?[]u8,
+    skip_audit: bool,
 ) !void {
     const index_url = try buildWebSkillIndexUrl(allocator, source);
     defer allocator.free(index_url);
@@ -1444,7 +1446,7 @@ fn installSkillsFromWellKnownIndex(
             return error.SkillSecurityAuditFailed;
         };
 
-        try installDownloadedWebSkillArtifact(allocator, artifact_bytes, resolved_url, entry.name, workspace_dir, detail_out);
+        try installDownloadedWebSkillArtifact(allocator, artifact_bytes, resolved_url, entry.name, workspace_dir, detail_out, skip_audit);
         installed_entries += 1;
     }
 
@@ -2593,7 +2595,7 @@ pub fn installSkillWithDetail(
     }
     if (isHttpsSource(source)) {
         if (shouldAttemptWellKnownIndex(source)) {
-            if (installSkillsFromWellKnownIndex(allocator, source, workspace_dir, detail_out)) {
+            if (installSkillsFromWellKnownIndex(allocator, source, workspace_dir, detail_out, skip_audit)) {
                 return;
             } else |err| {
                 switch (err) {
@@ -3906,6 +3908,7 @@ test "installDownloadedWebSkillArtifact installs zip archives into workspace" {
         "zip-skill",
         workspace_dir,
         null,
+        false,
     );
 
     const skill_md_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/skills/zip-skill/SKILL.md", .{workspace_dir});
@@ -3932,6 +3935,7 @@ test "installDownloadedWebSkillArtifact installs tar.gz archives into workspace"
         "tar-skill",
         workspace_dir,
         null,
+        false,
     );
 
     const skill_md_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/skills/tar-skill/SKILL.md", .{workspace_dir});
