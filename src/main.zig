@@ -1402,7 +1402,8 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\
             \\Commands:
             \\  list [--json]                 List installed skills
-            \\  install <source>              Install from GitHub URL or path
+            \\  install <source> [--force]    Install from GitHub URL or path
+            \\                                Use --force to skip security audit
             \\  install --name <query>        Search registry and install best match
             \\  remove <name>                 Remove a skill
             \\  info <name> [--json]          Show skill details
@@ -1452,11 +1453,12 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         }
     } else if (std.mem.eql(u8, subcmd, "install")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw skills install <source> | --name <query>\n", .{});
+            std.debug.print("Usage: nullclaw skills install <source> [--force] | --name <query>\n", .{});
             std_compat.process.exit(1);
         }
         var install_name: ?[]const u8 = null;
         var direct_source: ?[]const u8 = null;
+        var force = false;
         var i: usize = 1;
         while (i < sub_args.len) : (i += 1) {
             const arg = sub_args[i];
@@ -1473,6 +1475,10 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 i += 1;
                 continue;
             }
+            if (std.mem.eql(u8, arg, "--force")) {
+                force = true;
+                continue;
+            }
             if (std.mem.startsWith(u8, arg, "--")) {
                 std.debug.print("Unknown skills install option: {s}\n", .{arg});
                 std_compat.process.exit(1);
@@ -1484,7 +1490,7 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             direct_source = arg;
         }
         if (install_name == null and direct_source == null) {
-            std.debug.print("Usage: nullclaw skills install <source> | --name <query>\n", .{});
+            std.debug.print("Usage: nullclaw skills install <source> [--force] | --name <query>\n", .{});
             std_compat.process.exit(1);
         }
         var install_error_detail: ?[]u8 = null;
@@ -1500,7 +1506,7 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.debug.print("Skill installed from registry search: {s}\n", .{query});
             return;
         }
-        yc.skills.installSkillWithDetail(allocator, direct_source.?, cfg.workspace_dir, &install_error_detail) catch |err| {
+        yc.skills.installSkillWithDetail(allocator, direct_source.?, cfg.workspace_dir, &install_error_detail, force) catch |err| {
             if (install_error_detail) |msg| {
                 std.debug.print("{s}\n", .{msg});
             }
@@ -1746,6 +1752,13 @@ fn parseNonNegativeUsize(arg: []const u8) ?usize {
 fn hasJsonFlag(args: []const []const u8) bool {
     for (args) |a| {
         if (std.mem.eql(u8, a, "--json")) return true;
+    }
+    return false;
+}
+
+fn hasForceFlag(args: []const []const u8) bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--force") or std.mem.eql(u8, a, "-f")) return true;
     }
     return false;
 }
