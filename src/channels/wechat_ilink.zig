@@ -90,6 +90,7 @@ pub const WeChatIlinkChannel = struct {
         }
 
         try writer.writeAll("}");
+        plugin_config_buf = buf_writer.toArrayList();
 
         const plugin_config_json = try allocator.dupe(u8, plugin_config_buf.items);
 
@@ -133,3 +134,41 @@ pub const WeChatIlinkChannel = struct {
         };
     }
 };
+
+// Regression: buildExternalConfig previously read plugin_config_buf.items before
+// calling buf_writer.toArrayList(), so plugin_config_json was always "". The start
+// params then contained "config":} which caused the plugin to log:
+//   Error handling request: SyntaxError: JSON Parse error: Unexpected token '}'
+test "buildExternalConfig plugin_config_json is non-empty and valid JSON" {
+    const allocator = std.testing.allocator;
+    const cfg = config_types.WeChatIlinkConfig{
+        .account_id = "test",
+        .token = "tok123",
+        .command = "bun",
+    };
+    const ext = try WeChatIlinkChannel.buildExternalConfig(allocator, cfg);
+    defer allocator.free(ext.plugin_config_json);
+
+    // Must not be empty
+    try std.testing.expect(ext.plugin_config_json.len > 0);
+    // Must be valid JSON (parseable)
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, ext.plugin_config_json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    // token field must be present
+    const token_val = parsed.value.object.get("token") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("tok123", token_val.string);
+}
+
+test "buildExternalConfig plugin_config_json is valid JSON with no fields" {
+    const allocator = std.testing.allocator;
+    const cfg = config_types.WeChatIlinkConfig{
+        .account_id = "default",
+        .command = "bun",
+    };
+    const ext = try WeChatIlinkChannel.buildExternalConfig(allocator, cfg);
+    defer allocator.free(ext.plugin_config_json);
+
+    // Must be "{}" — an empty object, not an empty string
+    try std.testing.expectEqualStrings("{}", ext.plugin_config_json);
+}

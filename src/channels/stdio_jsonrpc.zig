@@ -1,6 +1,6 @@
 const std = @import("std");
 const std_compat = @import("compat");
-const root = @import("root.zig");
+const json_util = @import("../json_util.zig");
 
 const log = std.log.scoped(.stdio_jsonrpc);
 
@@ -461,17 +461,16 @@ fn buildJsonRpcRequest(allocator: std.mem.Allocator, request_id: u32, method: []
     errdefer buf.deinit(allocator);
 
     var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
-    defer buf_writer.deinit();
     const writer = &buf_writer.writer;
     try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try writer.print("{d}", .{request_id});
     try writer.writeAll(",\"method\":");
-    try root.appendJsonStringW(writer, method);
+    try json_util.appendJsonStringW(writer, method);
     try writer.writeAll(",\"params\":");
     try writer.writeAll(params_json);
     try writer.writeAll("}");
-
     buf = buf_writer.toArrayList();
+
     return buf.toOwnedSlice(allocator);
 }
 
@@ -479,6 +478,34 @@ fn remainingRequestTimeoutNs(deadline_ns: i128) u64 {
     const remaining_ns = deadline_ns - std_compat.time.nanoTimestamp();
     if (remaining_ns <= 0) return 0;
     return @intCast(remaining_ns);
+}
+
+// Regression: buildJsonRpcRequest previously mixed buf_writer writes with direct
+// buf writes via json_util.appendJsonString, causing return buf.toOwnedSlice() to
+// return only the method name (e.g. "get_manifest") instead of the full JSON-RPC
+// envelope. The plugin would then log "Invalid JSON-RPC request: \"get_manifest\"".
+test "buildJsonRpcRequest produces valid full JSON-RPC envelope" {
+    const allocator = std.testing.allocator;
+
+    const line = try buildJsonRpcRequest(allocator, 1, "get_manifest", "{}");
+    defer allocator.free(line);
+
+    try std.testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"get_manifest\",\"params\":{}}",
+        line,
+    );
+}
+
+test "buildJsonRpcRequest escapes special characters in method name" {
+    const allocator = std.testing.allocator;
+
+    const line = try buildJsonRpcRequest(allocator, 42, "meth\\od\"name", "{}");
+    defer allocator.free(line);
+
+    try std.testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"meth\\\\od\\\"name\",\"params\":{}}",
+        line,
+    );
 }
 
 test "stdio_jsonrpc buildJsonRpcRequest includes finalized body" {

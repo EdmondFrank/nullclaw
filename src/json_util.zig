@@ -50,6 +50,31 @@ pub fn appendJsonInt(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, key
     try buf.appendSlice(allocator, int_str);
 }
 
+/// Writer-based variant of appendJsonString.
+/// Appends a JSON-escaped string (with enclosing quotes) to any `std.io.Writer`-compatible writer.
+pub fn appendJsonStringW(writer: anytype, s: []const u8) !void {
+    try writer.writeByte('"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (c < 0x20) {
+                    var escape_buf: [6]u8 = undefined;
+                    const escape = std.fmt.bufPrint(&escape_buf, "\\u{x:0>4}", .{c}) catch unreachable;
+                    try writer.writeAll(escape);
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
+    try writer.writeByte('"');
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 test "appendJsonString empty string" {
