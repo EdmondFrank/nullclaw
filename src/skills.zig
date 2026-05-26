@@ -4878,7 +4878,7 @@ test "installSkillFromGit installs nested repository skills directory entries" {
     try runCommand(allocator, &.{ "git", "-C", repo, "add", "skills" });
     try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
 
-    try installSkillFromGit(allocator, repo, workspace, null);
+    try installSkillFromGit(allocator, repo, workspace, null, false);
 
     const skills = try listSkills(allocator, workspace, null);
     defer freeSkills(allocator, skills);
