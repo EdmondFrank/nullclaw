@@ -481,7 +481,6 @@ fn dispatchOutboundDirect(channel: root.Channel, msg: bus.OutboundMessage) !void
 
 fn dispatchClaimedOutboundDirect(channel: root.Channel, job: channel_outbox.DeliveryOutbox.ClaimedJob) !void {
     if (job.media.len == 0 and
-        job.choices.len > 0 and
         !outbound.has_legacy_attachment_markers(job.content))
     {
         channel.sendRich(job.chat_id, .{
@@ -1513,6 +1512,39 @@ test "durable outbound worker retries persisted final delivery" {
     try std.testing.expectEqual(@as(usize, 0), outbox.pendingCount());
     try std.testing.expectEqual(@as(u64, 2), mock_tg.final_attempts.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), mock_tg.sent_count.load(.monotonic));
+}
+
+// Regression: the durable outbox path must prefer sendRich for plain-text
+// final messages (no choices, no media), matching the direct dispatch path.
+// Previously, dispatchClaimedOutboundDirect required choices.len > 0 to call
+// sendRich, causing channels like Lark to receive plain text instead of cards.
+test "durable outbound worker uses sendRich for plain text without choices" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const outbox_path = try std_compat.fs.path.join(allocator, &.{ tmp_root, "delivery.json" });
+    defer allocator.free(outbox_path);
+
+    var outbox = try channel_outbox.DeliveryOutbox.init(allocator, outbox_path);
+    defer outbox.deinit();
+
+    var mock_lark = MockRichChannel{ .name_str = "lark" };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_lark.channel());
+
+    // Plain text final message — no choices, no media.
+    var msg = try bus.makeOutbound(allocator, "lark", "chat1", "Hello from agent");
+    defer msg.deinit(allocator);
+    _ = try outbox.enqueueFinal(msg);
+
+    try std.testing.expect(try drainDurableOutboundOutboxOnce(allocator, &outbox, &reg));
+    try std.testing.expectEqual(@as(usize, 0), outbox.pendingCount());
+    try std.testing.expectEqual(@as(u64, 1), mock_lark.rich_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), mock_lark.sent_count.load(.monotonic));
 }
 
 // Regression: if the process crashes after send success but before durable cleanup,

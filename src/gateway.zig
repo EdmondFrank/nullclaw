@@ -720,9 +720,9 @@ pub fn isWebhookAuthorized(pairing_guard: ?*const PairingGuard, bearer_token: ?[
 
 /// Returns true when a generic gateway endpoint (/webhook, /cron, /a2a) should
 /// be accepted for the current bind exposure and bearer token. Public binds
-/// always require a valid stored bearer token, even when interactive pairing is
-/// disabled, so generic endpoints cannot silently become anonymous Internet
-/// entrypoints.
+/// require a valid stored bearer token when pairing is enabled or tokens are
+/// configured. When pairing is disabled AND no tokens are configured, public
+/// binds allow anonymous access — the operator explicitly opted out of auth.
 pub fn isGenericGatewayEndpointAuthorized(
     pairing_guard: ?*const PairingGuard,
     bearer_token: ?[]const u8,
@@ -731,6 +731,7 @@ pub fn isGenericGatewayEndpointAuthorized(
     if (!public_bind) return isWebhookAuthorized(pairing_guard, bearer_token);
 
     const guard = pairing_guard orelse return false;
+    if (!guard.requirePairing() and !guard.hasPairedTokens()) return true;
     const token = bearer_token orelse return false;
     if (guard.requirePairing()) return guard.isAuthenticated(token);
     if (!guard.hasPairedTokens()) return false;
@@ -5962,14 +5963,14 @@ test "cron auth matrix: local bind follows admin auth" {
     try std.testing.expect(isCronRouteAuthorized(&guard, null, false));
 }
 
-test "cron auth matrix: public bind requires stored token" {
-    // Regression: public /cron must not inherit anonymous admin-route access.
+test "cron auth matrix: public bind allows anonymous when pairing disabled and no tokens" {
+    // Public /cron inherits anonymous access when pairing is disabled and no tokens are configured.
     var disabled_guard = try PairingGuard.init(std.testing.allocator, false, &.{});
     defer disabled_guard.deinit();
 
     try std.testing.expect(!isCronRouteAuthorized(null, null, true));
-    try std.testing.expect(!isCronRouteAuthorized(&disabled_guard, null, true));
-    try std.testing.expect(!isCronRouteAuthorized(&disabled_guard, "anything", true));
+    try std.testing.expect(isCronRouteAuthorized(&disabled_guard, null, true));
+    try std.testing.expect(isCronRouteAuthorized(&disabled_guard, "anything", true));
 
     const tokens = [_][]const u8{"zc_public_static_token"};
     var stored_guard = try PairingGuard.init(std.testing.allocator, false, &tokens);
@@ -5986,12 +5987,12 @@ test "generic endpoint auth matrix: loopback allows pairing-disabled local acces
     try std.testing.expect(isGenericGatewayEndpointAuthorized(&guard, null, false));
 }
 
-test "generic endpoint auth matrix: public bind denies pairing-disabled access without stored token" {
+test "generic endpoint auth matrix: public bind allows pairing-disabled access without stored token" {
     var guard = try PairingGuard.init(std.testing.allocator, false, &.{});
     defer guard.deinit();
 
-    try std.testing.expect(!isGenericGatewayEndpointAuthorized(&guard, null, true));
-    try std.testing.expect(!isGenericGatewayEndpointAuthorized(&guard, "anything", true));
+    try std.testing.expect(isGenericGatewayEndpointAuthorized(&guard, null, true));
+    try std.testing.expect(isGenericGatewayEndpointAuthorized(&guard, "anything", true));
 }
 
 test "generic endpoint auth matrix: public bind accepts stored token even when pairing disabled" {
