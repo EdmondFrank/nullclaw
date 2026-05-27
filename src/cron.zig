@@ -958,6 +958,13 @@ pub const CronScheduler = struct {
 
                         job.last_run_secs = now;
                         job.last_status = if (exec_result.success) "ok" else "error";
+                        if (exec_result.truncated_stdout or exec_result.truncated_stderr) {
+                            log.warn("cron agent job '{s}' output was truncated (stdout={s}, stderr={s})", .{
+                                job.id,
+                                if (exec_result.truncated_stdout) "yes" else "no",
+                                if (exec_result.truncated_stderr) "yes" else "no",
+                            });
+                        }
                         if (job.last_output) |old| self.allocator.free(old);
                         if (out_bus) |b| {
                             if (job.session_target == .main) {
@@ -2347,6 +2354,13 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
                     return;
                 };
                 defer allocator.free(result.output);
+                if (result.truncated_stdout or result.truncated_stderr) {
+                    log.warn("Agent job '{s}' output was truncated (stdout={s}, stderr={s})", .{
+                        id,
+                        if (result.truncated_stdout) "yes" else "no",
+                        if (result.truncated_stderr) "yes" else "no",
+                    });
+                }
                 if (result.output.len > 0) log.info("{s}", .{result.output});
                 job.last_run_secs = run_at;
                 job.last_status = if (result.success) "ok" else "error";

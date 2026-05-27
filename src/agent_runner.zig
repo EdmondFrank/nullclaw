@@ -12,6 +12,14 @@ const platform = @import("platform.zig");
 pub const AgentRunResult = struct {
     success: bool,
     output: []const u8,
+    truncated_stdout: bool = false,
+    truncated_stderr: bool = false,
+};
+
+const CollectResult = struct {
+    timed_out: bool,
+    truncated_stdout: bool,
+    truncated_stderr: bool,
 };
 
 pub const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -37,12 +45,14 @@ fn collectChildOutputWithTimeout(
     stderr: *std.ArrayList(u8),
     timeout_secs: u64,
     start_ns: i128,
-) !bool {
+) !CollectResult {
     const stdout_file = child.stdout.?;
     const stderr_file = child.stderr.?;
     var stdout_open = true;
     var stderr_open = true;
     var timed_out = false;
+    var truncated_stdout = false;
+    var truncated_stderr = false;
     var read_buf: [4096]u8 = undefined;
     while (true) {
         if (!stdout_open and !stderr_open) break;
@@ -55,9 +65,12 @@ fn collectChildOutputWithTimeout(
                 };
                 if (n == 0) {
                     stdout_open = false;
-                } else {
-                    try stdout.appendSlice(allocator, read_buf[0..n]);
-                    if (stdout.items.len > MAX_OUTPUT_BYTES) return error.StdoutStreamTooLong;
+                } else if (!truncated_stdout) {
+                    if (stdout.items.len + n > MAX_OUTPUT_BYTES) {
+                        truncated_stdout = true;
+                    } else {
+                        try stdout.appendSlice(allocator, read_buf[0..n]);
+                    }
                 }
             }
 
@@ -68,9 +81,12 @@ fn collectChildOutputWithTimeout(
                 };
                 if (n == 0) {
                     stderr_open = false;
-                } else {
-                    try stderr.appendSlice(allocator, read_buf[0..n]);
-                    if (stderr.items.len > MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
+                } else if (!truncated_stderr) {
+                    if (stderr.items.len + n > MAX_OUTPUT_BYTES) {
+                        truncated_stderr = true;
+                    } else {
+                        try stderr.appendSlice(allocator, read_buf[0..n]);
+                    }
                 }
             }
 
@@ -103,9 +119,12 @@ fn collectChildOutputWithTimeout(
                 };
                 if (n == 0) {
                     stdout_open = false;
-                } else {
-                    try stdout.appendSlice(allocator, read_buf[0..n]);
-                    if (stdout.items.len > MAX_OUTPUT_BYTES) return error.StdoutStreamTooLong;
+                } else if (!truncated_stdout) {
+                    if (stdout.items.len + n > MAX_OUTPUT_BYTES) {
+                        truncated_stdout = true;
+                    } else {
+                        try stdout.appendSlice(allocator, read_buf[0..n]);
+                    }
                 }
             }
 
@@ -116,9 +135,12 @@ fn collectChildOutputWithTimeout(
                 };
                 if (n == 0) {
                     stderr_open = false;
-                } else {
-                    try stderr.appendSlice(allocator, read_buf[0..n]);
-                    if (stderr.items.len > MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
+                } else if (!truncated_stderr) {
+                    if (stderr.items.len + n > MAX_OUTPUT_BYTES) {
+                        truncated_stderr = true;
+                    } else {
+                        try stderr.appendSlice(allocator, read_buf[0..n]);
+                    }
                 }
             }
         }
@@ -129,7 +151,11 @@ fn collectChildOutputWithTimeout(
         }
     }
 
-    return timed_out;
+    return .{
+        .timed_out = timed_out,
+        .truncated_stdout = truncated_stdout,
+        .truncated_stderr = truncated_stderr,
+    };
 }
 
 fn terminateChildHard(child: *std_compat.process.Child) !void {
@@ -151,6 +177,8 @@ fn buildAgentOutput(
     stderr: []const u8,
     timeout_secs: u64,
     timed_out: bool,
+    truncated_stdout: bool,
+    truncated_stderr: bool,
 ) ![]const u8 {
     if (timed_out) {
         const source = if (stdout.len > 0) stdout else stderr;
@@ -161,6 +189,15 @@ fn buildAgentOutput(
     }
 
     const output_source = if (stdout.len > 0) stdout else if (stderr.len > 0) stderr else "";
+
+    if (truncated_stdout and truncated_stderr) {
+        return std.fmt.allocPrint(allocator, "{s}\n[stdout+stderr truncated at {d} bytes each]", .{ output_source, MAX_OUTPUT_BYTES });
+    } else if (truncated_stdout) {
+        return std.fmt.allocPrint(allocator, "{s}\n[stdout truncated at {d} bytes]", .{ output_source, MAX_OUTPUT_BYTES });
+    } else if (truncated_stderr) {
+        return std.fmt.allocPrint(allocator, "{s}\n[stderr truncated at {d} bytes]", .{ output_source, MAX_OUTPUT_BYTES });
+    }
+
     return allocator.dupe(u8, output_source);
 }
 
@@ -260,7 +297,7 @@ pub fn run(
     var stderr: std.ArrayList(u8) = .empty;
     defer stderr.deinit(allocator);
 
-    const timed_out = try collectChildOutputWithTimeout(
+    const collect_result = try collectChildOutputWithTimeout(
         &child,
         allocator,
         &stdout,
@@ -270,12 +307,17 @@ pub fn run(
     );
 
     const term = try child.wait();
-    const success = !timed_out and switch (term) {
+    const success = !collect_result.timed_out and switch (term) {
         .exited => |code| code == 0,
         else => false,
     };
-    const output = try buildAgentOutput(allocator, stdout.items, stderr.items, timeout_secs, timed_out);
-    return .{ .success = success, .output = output };
+    const output = try buildAgentOutput(allocator, stdout.items, stderr.items, timeout_secs, collect_result.timed_out, collect_result.truncated_stdout, collect_result.truncated_stderr);
+    return .{
+        .success = success,
+        .output = output,
+        .truncated_stdout = collect_result.truncated_stdout,
+        .truncated_stderr = collect_result.truncated_stderr,
+    };
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -299,7 +341,7 @@ test "collectChildOutputWithTimeout disables timeout when set to zero" {
     var stderr: std.ArrayList(u8) = .empty;
     defer stderr.deinit(allocator);
 
-    const timed_out = try collectChildOutputWithTimeout(
+    const collect_result = try collectChildOutputWithTimeout(
         &child,
         allocator,
         &stdout,
@@ -309,7 +351,9 @@ test "collectChildOutputWithTimeout disables timeout when set to zero" {
     );
     const term = try child.wait();
 
-    try std.testing.expect(!timed_out);
+    try std.testing.expect(!collect_result.timed_out);
+    try std.testing.expect(!collect_result.truncated_stdout);
+    try std.testing.expect(!collect_result.truncated_stderr);
     switch (term) {
         .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
         else => try std.testing.expect(false),
@@ -336,7 +380,7 @@ test "collectChildOutputWithTimeout kills process after deadline" {
     var stderr: std.ArrayList(u8) = .empty;
     defer stderr.deinit(allocator);
 
-    const timed_out = try collectChildOutputWithTimeout(
+    const collect_result = try collectChildOutputWithTimeout(
         &child,
         allocator,
         &stdout,
@@ -346,7 +390,7 @@ test "collectChildOutputWithTimeout kills process after deadline" {
     );
     const term = try child.wait();
 
-    try std.testing.expect(timed_out);
+    try std.testing.expect(collect_result.timed_out);
     const completed_ok = switch (term) {
         .exited => |code| code == 0,
         else => false,
@@ -367,4 +411,44 @@ test "preferExecPath uses proc self exe for deleted linux path" {
 test "pathAgentExecutableName returns platform command name" {
     const expected = if (comptime builtin.os.tag == .windows) "nullclaw.exe" else "nullclaw";
     try std.testing.expectEqualStrings(expected, pathAgentExecutableName());
+}
+
+test "collectChildOutputWithTimeout truncates stdout at MAX_OUTPUT_BYTES" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    // Generate a command that writes more than MAX_OUTPUT_BYTES to stdout.
+    // Use `yes` which produces infinite output — we rely on the truncation guard.
+    var child = std_compat.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), "yes" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    const collect_result = try collectChildOutputWithTimeout(
+        &child,
+        allocator,
+        &stdout,
+        &stderr,
+        5,
+        std_compat.time.nanoTimestamp(),
+    );
+    _ = try child.kill();
+    _ = try child.wait();
+
+    // stdout should be truncated since `yes` produces unbounded output
+    try std.testing.expect(collect_result.truncated_stdout);
+    // stderr should remain empty (not truncated)
+    try std.testing.expect(!collect_result.truncated_stderr);
+    // The collected stdout should not exceed MAX_OUTPUT_BYTES
+    try std.testing.expect(stdout.items.len <= MAX_OUTPUT_BYTES);
 }

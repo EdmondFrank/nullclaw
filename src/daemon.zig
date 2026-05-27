@@ -307,6 +307,12 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
                             continue;
                         };
                         defer allocator.free(result.output);
+                        if (result.truncated_stdout or result.truncated_stderr) {
+                            log.warn("heartbeat agent output was truncated (stdout={s}, stderr={s})", .{
+                                if (result.truncated_stdout) "yes" else "no",
+                                if (result.truncated_stderr) "yes" else "no",
+                            });
+                        }
                         log.info("heartbeat agent completed (success={}, output_len={})", .{ result.success, result.output.len });
                         if (delivery) |cfg| {
                             _ = cron.deliverResult(allocator, cfg, result.output, result.success, event_bus) catch {};
