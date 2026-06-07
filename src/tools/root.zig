@@ -129,6 +129,7 @@ pub const process_util = @import("process_util.zig");
 pub const calculator = @import("calculator.zig");
 pub const sqlite_query = @import("sqlite_query.zig");
 pub const anonymize_text = @import("anonymize_text.zig");
+pub const view = @import("view.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
@@ -370,6 +371,9 @@ pub fn allTools(
         backend_name: []const u8 = "hybrid",
         sandbox_backend: ConfigSandboxBackend = .auto,
         sandbox_enabled: bool = true,
+        view_api_key: ?[]const u8 = null,
+        view_provider: []const u8 = "exhub",
+        view_model: []const u8 = "kimi-k2.6",
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .empty;
@@ -478,6 +482,18 @@ pub fn allTools(
     const calt = try allocator.create(calculator.CalculatorTool);
     calt.* = .{};
     try list.append(allocator, calt.tool());
+
+    // View tool — image analysis via vision models.
+    const vwt = try allocator.create(view.ViewTool);
+    vwt.* = .{
+        .configured_providers = opts.configured_providers,
+        .fallback_api_key = opts.view_api_key,
+        .view_provider = opts.view_provider,
+        .view_model = opts.view_model,
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+    };
+    try list.append(allocator, vwt.tool());
 
     const sqt = try allocator.create(sqlite_query.SqliteQueryTool);
     sqt.* = .{
@@ -936,10 +952,10 @@ test "all tools includes extras when enabled" {
 
     // Order: shell, file_read, file_write, file_edit, file_append, file_delete,
     //        file_read_hashed, file_edit_hashed, git, image_info, calculator,
-    //        sqlite_query, anonymize_text, memory_store, memory_recall,
+    //        view, sqlite_query, anonymize_text, memory_store, memory_recall,
     //        memory_list, memory_forget, delegate, schedule, spawn, pushover,
-    //        http_request, web_search, web_fetch, browser = 25
-    try std.testing.expectEqual(@as(usize, 25), tools.len);
+    //        http_request, web_search, web_fetch, browser = 26
+    try std.testing.expectEqual(@as(usize, 26), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -948,9 +964,9 @@ test "all tools excludes extras when disabled" {
 
     // Order: shell, file_read, file_write, file_edit, file_append, file_delete,
     //        file_read_hashed, file_edit_hashed, git, image_info, calculator,
-    //        sqlite_query, anonymize_text, memory_store, memory_recall,
-    //        memory_list, memory_forget, delegate, schedule, spawn = 20
-    try std.testing.expectEqual(@as(usize, 20), tools.len);
+    //        view, sqlite_query, anonymize_text, memory_store, memory_recall,
+    //        memory_list, memory_forget, delegate, schedule, spawn = 21
+    try std.testing.expectEqual(@as(usize, 21), tools.len);
 }
 
 test "all tools apply configured descriptions and enabled filters" {
@@ -976,7 +992,7 @@ test "all tools apply configured descriptions and enabled filters" {
 
     try std.testing.expect(!saw_shell);
     try std.testing.expect(saw_file_read);
-    try std.testing.expectEqual(@as(usize, 19), tools.len);
+    try std.testing.expectEqual(@as(usize, 20), tools.len);
 }
 
 test "all tools defers shell sandbox initialization by default" {
