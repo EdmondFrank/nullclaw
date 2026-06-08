@@ -12,6 +12,7 @@ This guide defines channel-specific operations checks for Lark/Feishu.
 1. Validate tenant token acquisition and refresh behavior.
 2. Treat non-zero business code as operational failure.
 3. Escalate permission/scope-like errors immediately.
+4. Image message download requires the `im:message` or `im:message:readonly` app scope in the Feishu/Lark developer console. Without this scope, the `GET /im/v1/messages/{message_id}/resources/{file_key}` call returns 403 and image messages are silently skipped. Downloaded images are saved under `{workspace_dir}/tmp/` (workspace-based temp directory).
 
 ## Fast Triage for `error.LarkApiError`
 

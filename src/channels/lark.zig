@@ -8,6 +8,7 @@ const http_util = @import("../http_util.zig");
 const outbound = @import("../outbound.zig");
 const websocket = @import("../websocket.zig");
 const thread_stacks = @import("../thread_stacks.zig");
+const platform = @import("../platform.zig");
 
 const log = std.log.scoped(.lark);
 
@@ -24,6 +25,8 @@ const LARK_WS_METHOD_CONTROL: i32 = 0;
 const LARK_WS_METHOD_DATA: i32 = 1;
 const LARK_API_MAX_BYTES: usize = 256 * 1024;
 const LARK_TYPING_PLACEHOLDER = "...";
+const LARK_IMAGE_MAX_BYTES: usize = 20 * 1024 * 1024;
+const LARK_RESOURCE_TIMEOUT_SECS = "30";
 
 const LarkWsConnectConfig = struct {
     url: []u8,
@@ -102,6 +105,11 @@ pub const LarkChannel = struct {
     /// Epoch seconds when cached_token expires.
     token_expires_at: i64 = 0,
     reaction_emojis: []const []const u8 = &.{},
+    /// Workspace directory for temp file storage (images, attachments).
+    /// Set by ChannelManager from Config.workspace_dir. When non-empty,
+    /// downloaded media is saved under `{workspace_dir}/tmp/` instead of the
+    /// system temp directory.
+    workspace_dir: []const u8 = "",
     /// Pending reaction message_ids queued per chat_id (for undo after responses are sent).
     pending_reactions: std.StringHashMapUnmanaged(PendingReactionQueue) = .empty,
     typing_mutex: std_compat.sync.Mutex = .{},
@@ -317,11 +325,83 @@ pub const LarkChannel = struct {
         self.event_bus = b;
     }
 
+    /// Download an image resource from a Lark message and save to a local temp file.
+    /// Uses GET /im/v1/messages/{message_id}/resources/{image_key}?type=image
+    /// Returns the local file path (caller-owned), or null on failure.
+    fn downloadLarkImage(self: *LarkChannel, allocator: std.mem.Allocator, message_id: []const u8, image_key: []const u8) ?[]u8 {
+        if (comptime builtin.is_test) return null;
+        if (message_id.len == 0 or image_key.len == 0) return null;
+
+        const token = self.getTenantAccessToken() catch |err| {
+            log.warn("downloadLarkImage: getTenantAccessToken failed: {}", .{err});
+            return null;
+        };
+        defer allocator.free(token);
+
+        var auth_buf: [512]u8 = undefined;
+        const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch return null;
+        var auth_header_buf: [576]u8 = undefined;
+        const auth_header = std.fmt.bufPrint(&auth_header_buf, "Authorization: {s}", .{auth_value}) catch return null;
+
+        var url_buf: [1024]u8 = undefined;
+        var url_writer: std.Io.Writer = .fixed(&url_buf);
+        url_writer.print("{s}/im/v1/messages/{s}/resources/{s}?type=image", .{ self.apiBase(), message_id, image_key }) catch return null;
+        const url = url_writer.buffered();
+
+        const headers = [_][]const u8{auth_header};
+        const bytes = http_util.curlGetMaxBytes(allocator, url, &headers, LARK_RESOURCE_TIMEOUT_SECS, LARK_IMAGE_MAX_BYTES) catch |err| {
+            log.warn("downloadLarkImage: download failed for message {s}: {}", .{ message_id, err });
+            return null;
+        };
+        defer allocator.free(bytes);
+
+        if (bytes.len == 0 or bytes.len > LARK_IMAGE_MAX_BYTES) return null;
+
+        // Use workspace-based temp dir when available, else system temp.
+        const tmp_dir = if (self.workspace_dir.len > 0)
+            std.fmt.allocPrint(allocator, "{s}/tmp", .{self.workspace_dir}) catch return null
+        else
+            platform.getTempDir(allocator) catch return null;
+        defer allocator.free(tmp_dir);
+
+        // Ensure the temp directory exists.
+        if (self.workspace_dir.len > 0) {
+            std_compat.fs.makeDirAbsolute(tmp_dir) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => {
+                    log.warn("downloadLarkImage: makeDirAbsolute({s}) failed: {}", .{ tmp_dir, err });
+                    return null;
+                },
+            };
+        }
+        const ts: u64 = @intCast(@max(std_compat.time.timestamp(), 0));
+        const nonce = std_compat.crypto.random.int(u64);
+
+        var file_buf: [256]u8 = undefined;
+        const file_name = std.fmt.bufPrint(&file_buf, "nullclaw_lark_image_{d}_{x}.jpg", .{ ts, nonce }) catch return null;
+
+        var path_buf: [512]u8 = undefined;
+        var path_writer: std.Io.Writer = .fixed(&path_buf);
+        path_writer.print("{s}/{s}", .{ tmp_dir, file_name }) catch return null;
+        const local_path = path_writer.buffered();
+
+        const file = std_compat.fs.createFileAbsolute(local_path, .{ .read = false, .truncate = true }) catch |err| {
+            log.warn("downloadLarkImage: file create failed: {}", .{err});
+            return null;
+        };
+        defer file.close();
+        file.writeAll(bytes) catch return null;
+
+        return allocator.dupe(u8, local_path) catch null;
+    }
+
     /// Parse a Lark event callback payload and extract text messages or card actions.
-    /// Supports "text", "post", and card action callback events.
+    /// Supports "text", "post", "image", and card action callback events.
     /// For group chats, only responds when the bot is @-mentioned.
+    /// For "image" messages, downloads the image to a local temp file and
+    /// prepends an [IMAGE:path] marker for the agent's multimodal pipeline.
     pub fn parseEventPayload(
-        self: *const LarkChannel,
+        self: *LarkChannel,
         allocator: std.mem.Allocator,
         payload: []const u8,
     ) ![]ParsedLarkMessage {
@@ -406,6 +486,25 @@ pub const LarkChannel = struct {
         } else if (std.mem.eql(u8, msg_type, "post")) blk: {
             const maybe = parsePostContent(allocator, content_str) catch return result.items;
             break :blk maybe orelse return result.items;
+        } else if (std.mem.eql(u8, msg_type, "image")) blk: {
+            // Content is a JSON string like {"image_key":"img_v2_xxx"}
+            const inner = std.json.parseFromSlice(std.json.Value, allocator, content_str, .{}) catch return result.items;
+            defer inner.deinit();
+            if (inner.value != .object) return result.items;
+            const image_key_val = inner.value.object.get("image_key") orelse return result.items;
+            const image_key = if (image_key_val == .string) image_key_val.string else return result.items;
+            if (image_key.len == 0) return result.items;
+
+            // Extract message_id for the download API
+            const msg_id_val = msg_obj.object.get("message_id");
+            const msg_id = if (msg_id_val) |mid_val| (if (mid_val == .string) mid_val.string else "") else "";
+            if (msg_id.len == 0) return result.items;
+
+            const local_path = self.downloadLarkImage(allocator, msg_id, image_key) orelse return result.items;
+            defer allocator.free(local_path);
+
+            // Format as [IMAGE:path] marker for the multimodal pipeline
+            break :blk try std.fmt.allocPrint(allocator, "[IMAGE:{s}]", .{local_path});
         } else return result.items;
         defer allocator.free(raw_text);
 
@@ -2329,7 +2428,7 @@ fn larkWsPingLoop(ctx: *LarkWsPingLoopCtx) void {
 test "lark parse valid text message" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"ou_testuser123"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
         \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_testuser123"}},"message":{"message_type":"text","content":"{\"text\":\"Hello nullclaw!\"}","chat_id":"oc_chat123","create_time":"1699999999000"}}}
@@ -2354,7 +2453,7 @@ test "lark parse valid text message" {
 test "lark parse group message marks is_group" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
         \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_group_user"}},"message":{"message_type":"text","content":"{\"text\":\"hello group\"}","chat_type":"group","mentions":[{"key":"@_user_1"}],"chat_id":"oc_group_1","create_time":"1000"}}}
@@ -2376,7 +2475,7 @@ test "lark parse group message marks is_group" {
 test "lark parse unauthorized user" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"ou_testuser123"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
         \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_unauthorized"}},"message":{"message_type":"text","content":"{\"text\":\"spam\"}","chat_id":"oc_chat","create_time":"1000"}}}
@@ -2390,7 +2489,7 @@ test "lark parse unauthorized user" {
 test "lark parse non-text skipped" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
         \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_user"}},"message":{"message_type":"image","content":"{}","chat_id":"oc_chat"}}}
@@ -2401,10 +2500,85 @@ test "lark parse non-text skipped" {
     try std.testing.expectEqual(@as(usize, 0), msgs.len);
 }
 
+test "lark parse unsupported message type is skipped" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    const payload =
+        \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_user"}},"message":{"message_type":"file","content":"{}","chat_id":"oc_chat","create_time":"1000"}}}
+    ;
+
+    const msgs = try ch.parseEventPayload(allocator, payload);
+    defer allocator.free(msgs);
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
+test "lark parse image with missing image_key is skipped" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    const payload =
+        \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_user"}},"message":{"message_type":"image","content":"{\"other_field\":\"value\"}","chat_id":"oc_chat","message_id":"om_img_001","create_time":"1000"}}}
+    ;
+
+    const msgs = try ch.parseEventPayload(allocator, payload);
+    defer allocator.free(msgs);
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
+test "lark parse image with missing message_id is skipped" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    const payload =
+        \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_user"}},"message":{"message_type":"image","content":"{\"image_key\":\"img_v2_test\"}","chat_id":"oc_chat","create_time":"1000"}}}
+    ;
+
+    const msgs = try ch.parseEventPayload(allocator, payload);
+    defer allocator.free(msgs);
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
+test "lark parse image with valid image_key and message_id skipped in tests" {
+    // In test mode, downloadLarkImage returns null (no real HTTP), so image
+    // messages are skipped. This verifies the parsing path doesn't panic.
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    const payload =
+        \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_user"}},"message":{"message_type":"image","content":"{\"image_key\":\"img_v2_test123\"}","chat_id":"oc_chat","message_id":"om_img_002","create_time":"1000"}}}
+    ;
+
+    const msgs = try ch.parseEventPayload(allocator, payload);
+    defer allocator.free(msgs);
+    // downloadLarkImage returns null in tests, so no message is produced
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
+test "lark parse image in group chat respects mentions" {
+    // Image messages in group chats should only be processed when bot is mentioned
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    // Group image message WITHOUT mentions — should be skipped even before download
+    const payload =
+        \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_user"}},"message":{"message_type":"image","content":"{\"image_key\":\"img_v2_test\"}","chat_type":"group","chat_id":"oc_group","message_id":"om_img_003","create_time":"1000"}}}
+    ;
+
+    const msgs = try ch.parseEventPayload(allocator, payload);
+    defer allocator.free(msgs);
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
 test "lark parse wrong event type" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
         \\{"header":{"event_type":"im.chat.disbanded_v1"},"event":{}}
@@ -2418,7 +2592,7 @@ test "lark parse wrong event type" {
 test "lark parse empty text skipped" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
         \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_user"}},"message":{"message_type":"text","content":"{\"text\":\"\"}","chat_id":"oc_chat"}}}
@@ -2436,7 +2610,7 @@ test "lark parse empty text skipped" {
 test "lark parse challenge produces no messages" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
     const payload =
         \\{"challenge":"abc123","token":"test_verification_token","type":"url_verification"}
     ;
@@ -2448,7 +2622,7 @@ test "lark parse challenge produces no messages" {
 test "lark parse non-object payload is ignored safely" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
     const msgs = try ch.parseEventPayload(allocator, "\"not an object\"");
     defer allocator.free(msgs);
     try std.testing.expectEqual(@as(usize, 0), msgs.len);
@@ -2457,7 +2631,7 @@ test "lark parse non-object payload is ignored safely" {
 test "lark parse invalid header shape is ignored safely" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
     const payload = "{\"header\":\"oops\",\"event\":{}}";
     const msgs = try ch.parseEventPayload(allocator, payload);
     defer allocator.free(msgs);
@@ -2467,7 +2641,7 @@ test "lark parse invalid header shape is ignored safely" {
 test "lark parse missing sender" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
     const payload =
         \\{"header":{"event_type":"im.message.receive_v1"},"event":{"message":{"message_type":"text","content":"{\"text\":\"hello\"}","chat_id":"oc_chat"}}}
     ;
@@ -2479,7 +2653,7 @@ test "lark parse missing sender" {
 test "lark parse missing event" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"ou_testuser123"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
     const payload =
         \\{"header":{"event_type":"im.message.receive_v1"}}
     ;
@@ -2491,7 +2665,7 @@ test "lark parse missing event" {
 test "lark parse invalid content json" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
     const payload =
         \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_user"}},"message":{"message_type":"text","content":"not valid json","chat_id":"oc_chat"}}}
     ;
@@ -2503,7 +2677,7 @@ test "lark parse invalid content json" {
 test "lark parse unicode message" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
     const payload =
         \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_user"}},"message":{"message_type":"text","content":"{\"text\":\"Hello World\"}","chat_id":"oc_chat","create_time":"1000"}}}
     ;
@@ -2522,7 +2696,7 @@ test "lark parse unicode message" {
 test "lark parse fallback sender to open_id when no chat_id" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
     // No chat_id field at all
     const payload =
         \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_user"}},"message":{"message_type":"text","content":"{\"text\":\"hello\"}","create_time":"1000"}}}
@@ -2728,7 +2902,7 @@ test "lark token caching returns same token within expiry" {
 test "lark parse post message type via parseEventPayload" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
         \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_user"}},"message":{"message_type":"post","content":"{\"zh_cn\":{\"title\":\"\",\"content\":[[{\"tag\":\"text\",\"text\":\"post message\"}]]}}","chat_id":"oc_chat","create_time":"1000"}}}
@@ -3207,7 +3381,7 @@ test "lark buildWebsocketPong handles unicode timestamp" {
 test "lark parseEventPayload handles websocket message format" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     // WebSocket payload format includes uuid field
     const payload =
@@ -3231,7 +3405,7 @@ test "lark parseEventPayload handles websocket message format" {
 test "lark parseEventPayload captures message_id for reactions" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
         \\{"uuid":"uuid-123-456","header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_user"}},"message":{"message_id":"om_456","message_type":"text","content":"{\"text\":\"websocket message\"}","chat_id":"oc_chat","create_time":"1700000000000"}}}
@@ -3253,7 +3427,7 @@ test "lark parseEventPayload captures message_id for reactions" {
 test "lark parseEventPayload handles websocket message with mentions" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     // WebSocket payload with mentions array
     const payload =
@@ -3316,7 +3490,7 @@ test "lark initFromConfig carries reaction emojis" {
 }
 
 test "lark running and connected defaults" {
-    const ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
+    var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
     try std.testing.expect(!ch.running.load(.acquire));
     try std.testing.expect(!ch.connected.load(.acquire));
     try std.testing.expect(ch.cached_token == null);
@@ -3377,7 +3551,7 @@ test "lark resetOwnedState deletes tracked typing placeholders" {
 test "lark parseEventPayload websocket payload with post message" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     // WebSocket payload with post message type
     const payload =
@@ -3400,7 +3574,7 @@ test "lark parseEventPayload websocket payload with post message" {
 test "lark parse card action trigger emits choice message" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"ou_user"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
         \\{"header":{"event_type":"card.action.trigger"},"event":{"operator":{"operator_id":{"open_id":"ou_user"}},"context":{"open_chat_id":"oc_chat_1","chat_type":"group"},"action":{"tag":"button","value":{"choice_id":"yes"}}}}
@@ -3424,7 +3598,7 @@ test "lark parse card action trigger emits choice message" {
 test "lark parse card action trigger_v1 reads submit text" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"ou_user"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
         \\{"header":{"event_type":"card.action.trigger_v1"},"context":{"open_chat_id":"oc_chat_2"},"event":{"operator":{"operator_id":{"open_id":"ou_user"}},"action":{"tag":"button","value":{"submit_text":"confirm"}}}}
@@ -3447,7 +3621,7 @@ test "lark parse card action trigger_v1 reads submit text" {
 test "lark parse direct card action trigger keeps direct route" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"ou_user"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
         \\{"header":{"event_type":"card.action.trigger"},"event":{"operator":{"operator_id":{"open_id":"ou_user"}},"context":{"open_chat_id":"oc_dm_1","chat_type":"p2p"},"action":{"tag":"button","value":{"choice_id":"yes"}}}}
@@ -3471,7 +3645,7 @@ test "lark parse direct card action trigger keeps direct route" {
 test "lark parse card action trigger reads form value" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"ou_user"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
         \\{"header":{"event_type":"card.action.trigger"},"event":{"operator":{"operator_id":{"open_id":"ou_user"}},"context":{"open_chat_id":"oc_chat_3"},"action":{"tag":"form","form_value":{"choice_select":["picked"]}}}}
@@ -3494,7 +3668,7 @@ test "lark parse card action trigger reads form value" {
 test "lark parse card action trigger without open id requires wildcard allowlist" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
         \\{"header":{"event_type":"card.action.trigger"},"event":{"context":{"open_chat_id":"oc_chat_4","chat_type":"group"},"action":{"tag":"button","value":{"choice_id":"yes"}}}}
@@ -3522,7 +3696,7 @@ test "lark parse card action trigger without open id requires wildcard allowlist
 test "lark build card action callback response returns raw card" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"ou_user"};
-    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
 
     const payload =
         \\{"header":{"event_type":"card.action.trigger"},"event":{"operator":{"operator_id":{"open_id":"ou_user"}},"action":{"tag":"button","value":{"choice_id":"yes"}}}}

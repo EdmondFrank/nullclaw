@@ -218,6 +218,9 @@ pub const ChannelManager = struct {
                 self.config.messages.inbound.debounce_ms,
             );
         }
+        if (comptime std.mem.eql(u8, field_name, "lark")) {
+            ch_ptr.workspace_dir = self.config.workspace_dir;
+        }
         self.maybeAttachBus(ch_ptr);
 
         const ch = ch_ptr.channel();

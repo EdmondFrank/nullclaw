@@ -12,6 +12,7 @@
 1. 校验租户 token 获取与刷新行为。
 2. 业务码非零应视为运行失败。
 3. 权限/scope 类错误应立即升级处理。
+4. 图片消息下载需要在飞书/Lark 开发者控制台配置 `im:message` 或 `im:message:readonly` 应用权限。缺少此权限时，`GET /im/v1/messages/{message_id}/resources/{file_key}` 调用会返回 403，图片消息将被静默跳过。下载的图片保存在 `{workspace_dir}/tmp/`（基于工作区的临时目录）下。
 
 ## `error.LarkApiError` 快速排查
 
