@@ -50,6 +50,19 @@ pub fn getShell() []const u8 {
     return if (comptime builtin.os.tag == .windows) "cmd.exe" else "/bin/sh";
 }
 
+/// Returns the user's preferred shell by reading the `SHELL` environment
+/// variable. Falls back to `/bin/sh` when `SHELL` is unset or empty.
+/// On Windows, always returns `"cmd.exe"` (unchanged).
+/// Caller owns the returned slice and must free it with `allocator.free()`.
+pub fn getShellAlloc(allocator: std.mem.Allocator) []const u8 {
+    if (comptime builtin.os.tag == .windows) return "cmd.exe";
+    if (getEnvOrNull(allocator, "SHELL")) |shell| {
+        if (shell.len > 0) return shell;
+        allocator.free(shell);
+    }
+    return "/bin/sh";
+}
+
 /// Returns the shell flag for passing a command string.
 pub fn getShellFlag() []const u8 {
     return if (comptime builtin.os.tag == .windows) "/c" else "-c";
@@ -76,4 +89,19 @@ test "getTempDir returns a non-empty string" {
 test "getShell returns a known value" {
     const shell = getShell();
     try std.testing.expect(shell.len > 0);
+}
+
+test "getShellAlloc returns SHELL env var or fallback" {
+    const shell = getShellAlloc(std.testing.allocator);
+    defer if (!std.mem.eql(u8, shell, "/bin/sh") and !std.mem.eql(u8, shell, "cmd.exe"))
+        std.testing.allocator.free(shell);
+    try std.testing.expect(shell.len > 0);
+    if (comptime builtin.os.tag == .windows) {
+        try std.testing.expectEqualStrings("cmd.exe", shell);
+    } else {
+        // Either the real $SHELL or the /bin/sh fallback
+        try std.testing.expect(
+            std.mem.eql(u8, shell, "/bin/sh") or shell[0] == '/',
+        );
+    }
 }

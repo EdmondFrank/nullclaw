@@ -287,20 +287,23 @@ pub const ShellTool = struct {
             }
         }
 
+        // Resolve the user's preferred shell from $SHELL (falls back to /bin/sh).
+        const shell_path = platform.getShellAlloc(allocator);
+        defer if (!std.mem.eql(u8, shell_path, "/bin/sh") and !std.mem.eql(u8, shell_path, "cmd.exe"))
+            allocator.free(shell_path);
+
         if (builtin.os.tag == .windows) {
             const parsed = try parseWindowsCommandArgv(allocator, command);
             maybe_owned_argv = parsed;
             if (parsed.len > 0 and isPowerShellExecutable(parsed[0])) {
                 base_argv = parsed;
             } else {
-                const shell_cmd = platform.getShell();
                 const shell_flag = platform.getShellFlag();
-                base_argv = &.{ shell_cmd, shell_flag, command };
+                base_argv = &.{ shell_path, shell_flag, command };
             }
         } else {
-            const shell_cmd = platform.getShell();
             const shell_flag = platform.getShellFlag();
-            base_argv = &.{ shell_cmd, shell_flag, command };
+            base_argv = &.{ shell_path, shell_flag, command };
         }
 
         // Apply sandbox wrapper if configured.
