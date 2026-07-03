@@ -71,6 +71,11 @@ pub const ViewTool = struct {
         if (!std.mem.eql(u8, response_format, "text") and !std.mem.eql(u8, response_format, "json"))
             return ToolResult.fail("Invalid response_format: must be 'text' or 'json'");
 
+        // Reject non-HTTPS URLs early (security: HTTP is not allowed)
+        if (isHttpUrl(image)) {
+            return ToolResult.fail("HTTP URLs are not supported; use HTTPS instead");
+        }
+
         // Prepare image content part
         const image_part = self.prepareImageContent(allocator, image) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to prepare image: {s}", .{@errorName(err)});
@@ -152,10 +157,6 @@ pub const ViewTool = struct {
     fn prepareImageContent(self: *ViewTool, allocator: std.mem.Allocator, image: []const u8) !providers.ContentPart {
         if (isHttpsUrl(image)) {
             return providers.makeImageUrlPart(image);
-        }
-
-        if (isHttpUrl(image)) {
-            return error.HttpNotSupported;
         }
 
         // Local file — read and base64 encode
